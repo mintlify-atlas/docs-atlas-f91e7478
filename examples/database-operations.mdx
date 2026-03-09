@@ -1,0 +1,480 @@
+---
+title: "Database Operations"
+description: "Add resilience to database queries with retries, timeouts, and circuit breakers"
+---
+
+## Overview
+
+Database operations can fail due to connection issues, deadlocks, or transient errors. The Resilience library helps you build robust database clients that automatically handle these failures.
+
+## Basic Database Query with Retries
+
+Wrap database queries with retry logic to handle transient failures:
+
+```typescript
+import { withResilience } from '@oldwhisper/resilience';
+
+// Example using a generic database client
+interface DbClient {
+  query(sql: string, params?: any[]): Promise<any>;
+}
+
+class ResilientDatabase {
+  constructor(private db: DbClient) {}
+  
+  // Query with automatic retries
+  query = withResilience(
+    async (sql: string, params?: any[]) => {
+      return await this.db.query(sql, params);
+    },
+    {
+      name: 'db.query',
+      retries: 3,
+      timeoutMs: 10000,  // 10 second timeout
+      backoff: {
+        type: 'exponential',
+        baseDelayMs: 100,
+        maxDelayMs: 2000,
+        jitter: true
+      },
+      // Retry on connection errors and deadlocks
+      retryOn: (error: any) => {
+        const message = error.message || '';
+        return message.includes('ECONNREFUSED') ||
+               message.includes('ETIMEDOUT') ||
+               message.includes('deadlock') ||
+               message.includes('connection') ||
+               error.code === 'PROTOCOL_CONNECTION_LOST';
+      },
+      useAbortSignal: true
+    }
+  );
+}
+
+// Usage
+const resilientDb = new ResilientDatabase(myDbClient);
+
+try {
+  const users = await resilientDb.query(
+    'SELECT * FROM users WHERE status = ?',
+    ['active']
+  );
+  console.log('Found users:', users);
+} catch (error) {
+  console.error('Query failed after retries:', error);
+}
+```
+
+<Note>
+  Always use parameterized queries to prevent SQL injection, even when adding resilience wrappers.
+</Note>
+
+## Transaction Handling
+
+Transactions require special handling since they maintain state across multiple operations:
+
+```typescript
+import { withResilience } from '@oldwhisper/resilience';
+
+class ResilientDatabase {
+  constructor(private db: DbClient) {}
+  
+  // Wrap the entire transaction, not individual queries
+  transaction = withResilience(
+    async <T>(callback: (tx: DbClient) => Promise<T>): Promise<T> => {
+      // Begin transaction
+      await this.db.query('BEGIN');
+      
+      try {
+        // Execute callback with transaction context
+        const result = await callback(this.db);
+        
+        // Commit if successful
+        await this.db.query('COMMIT');
+        return result;
+      } catch (error) {
+        // Rollback on error
+        await this.db.query('ROLLBACK');
+        throw error;
+      }
+    },
+    {
+      name: 'db.transaction',
+      retries: 2,  // Fewer retries for transactions
+      timeoutMs: 30000,  // Longer timeout for multi-step operations
+      backoff: {
+        type: 'exponential',
+        baseDelayMs: 500,
+        maxDelayMs: 5000
+      },
+      // Only retry on serialization failures and deadlocks
+      retryOn: (error: any) => {
+        const message = error.message || '';
+        return message.includes('deadlock') ||
+               message.includes('serialization failure') ||
+               message.includes('could not serialize');
+      },
+      useAbortSignal: true
+    }
+  );
+}
+
+// Usage
+const resilientDb = new ResilientDatabase(myDbClient);
+
+try {
+  const result = await resilientDb.transaction(async (tx) => {
+    // Deduct from sender
+    await tx.query(
+      'UPDATE accounts SET balance = balance - ? WHERE id = ?',
+      [amount, senderId]
+    );
+    
+    // Add to receiver
+    await tx.query(
+      'UPDATE accounts SET balance = balance + ? WHERE id = ?',
+      [amount, receiverId]
+    );
+    
+    // Log transaction
+    const [log] = await tx.query(
+      'INSERT INTO transactions (sender_id, receiver_id, amount) VALUES (?, ?, ?) RETURNING id',
+      [senderId, receiverId, amount]
+    );
+    
+    return log.id;
+  });
+  
+  console.log('Transaction completed:', result);
+} catch (error) {
+  console.error('Transaction failed:', error);
+}
+```
+
+<Tip>
+  Wrap the entire transaction logic, not individual queries within a transaction. This ensures the transaction is retried as a complete unit.
+</Tip>
+
+## Connection Pool Management
+
+<Tabs>
+  <Tab title="With Circuit Breaker">
+    Use a circuit breaker to prevent overwhelming a struggling database:
+
+    ```typescript
+    import { withResilience } from '@oldwhisper/resilience';
+
+    class ResilientDatabase {
+      constructor(private db: DbClient) {}
+      
+      query = withResilience(
+        async (sql: string, params?: any[]) => {
+          return await this.db.query(sql, params);
+        },
+        {
+          name: 'db.query',
+          retries: 3,
+          timeoutMs: 10000,
+          backoff: {
+            type: 'exponential',
+            baseDelayMs: 100,
+            maxDelayMs: 2000,
+            jitter: true
+          },
+          circuitBreaker: {
+            failureThreshold: 5,  // Open after 5 consecutive failures
+            resetTimeoutMs: 60000  // Try again after 1 minute
+          },
+          retryOn: (error: any) => {
+            const message = error.message || '';
+            return message.includes('connection') ||
+                   message.includes('ETIMEDOUT') ||
+                   message.includes('ECONNREFUSED');
+          },
+          useAbortSignal: true,
+          hooks: {
+            onCircuitOpen: ({ name }) => {
+              console.error(`🚨 Database circuit opened - connection issues detected`);
+              // Could trigger alerts, switch to read replica, etc.
+            },
+            onCircuitClosed: ({ name }) => {
+              console.info(`✅ Database circuit closed - connection restored`);
+            }
+          }
+        }
+      );
+    }
+
+    const resilientDb = new ResilientDatabase(myDbClient);
+    
+    // Circuit will open after 5 failures, preventing connection pool exhaustion
+    const users = await resilientDb.query('SELECT * FROM users');
+    ```
+  </Tab>
+  
+  <Tab title="Read Replica Fallback">
+    Automatically fall back to read replicas when the primary fails:
+
+    ```typescript
+    import { withResilience } from '@oldwhisper/resilience';
+
+    class ResilientDatabase {
+      constructor(
+        private primaryDb: DbClient,
+        private replicaDb: DbClient
+      ) {}
+      
+      // Read query with replica fallback
+      queryRead = withResilience(
+        async (sql: string, params?: any[]) => {
+          try {
+            return await this.primaryDb.query(sql, params);
+          } catch (primaryError) {
+            console.warn('Primary failed, trying replica:', primaryError.message);
+            return await this.replicaDb.query(sql, params);
+          }
+        },
+        {
+          name: 'db.queryRead',
+          retries: 2,
+          timeoutMs: 8000,
+          backoff: {
+            type: 'exponential',
+            baseDelayMs: 200,
+            maxDelayMs: 2000
+          },
+          retryOn: (error: any) => {
+            return error.message?.includes('connection');
+          },
+          useAbortSignal: true
+        }
+      );
+      
+      // Write query (primary only)
+      queryWrite = withResilience(
+        async (sql: string, params?: any[]) => {
+          return await this.primaryDb.query(sql, params);
+        },
+        {
+          name: 'db.queryWrite',
+          retries: 3,
+          timeoutMs: 15000,
+          backoff: {
+            type: 'exponential',
+            baseDelayMs: 500,
+            maxDelayMs: 5000,
+            jitter: true
+          },
+          circuitBreaker: {
+            failureThreshold: 5,
+            resetTimeoutMs: 60000
+          },
+          retryOn: (error: any) => {
+            return error.message?.includes('connection') ||
+                   error.message?.includes('deadlock');
+          },
+          useAbortSignal: true
+        }
+      );
+    }
+
+    const resilientDb = new ResilientDatabase(primaryClient, replicaClient);
+    
+    // Reads can use replica as fallback
+    const users = await resilientDb.queryRead('SELECT * FROM users');
+    
+    // Writes only go to primary
+    await resilientDb.queryWrite(
+      'INSERT INTO users (name, email) VALUES (?, ?)',
+      ['Alice', 'alice@example.com']
+    );
+    ```
+  </Tab>
+</Tabs>
+
+## Long-Running Queries
+
+Handle queries that might take longer with appropriate timeouts:
+
+```typescript
+import { withResilience } from '@oldwhisper/resilience';
+
+class ResilientDatabase {
+  constructor(private db: DbClient) {}
+  
+  // Standard queries - short timeout
+  query = withResilience(
+    async (sql: string, params?: any[]) => {
+      return await this.db.query(sql, params);
+    },
+    {
+      name: 'db.query',
+      retries: 3,
+      timeoutMs: 10000,  // 10 seconds
+      backoff: { type: 'exponential', baseDelayMs: 100, maxDelayMs: 2000 },
+      retryOn: (error: any) => error.message?.includes('connection'),
+      useAbortSignal: true
+    }
+  );
+  
+  // Analytics queries - longer timeout, no retries
+  queryAnalytics = withResilience(
+    async (sql: string, params?: any[]) => {
+      return await this.db.query(sql, params);
+    },
+    {
+      name: 'db.queryAnalytics',
+      retries: 0,  // No retries for expensive queries
+      timeoutMs: 120000,  // 2 minutes
+      useAbortSignal: true,
+      hooks: {
+        onAttempt: ({ name }) => {
+          console.log(`Starting analytics query...`);
+        },
+        onSuccess: ({ timeMs }) => {
+          console.log(`Analytics query completed in ${timeMs}ms`);
+        },
+        onFailure: ({ error }) => {
+          console.error('Analytics query failed:', error);
+        }
+      }
+    }
+  );
+}
+
+const resilientDb = new ResilientDatabase(myDbClient);
+
+// Fast query with retries
+const user = await resilientDb.query(
+  'SELECT * FROM users WHERE id = ?',
+  [userId]
+);
+
+// Slow analytics query with timeout but no retries
+const report = await resilientDb.queryAnalytics(`
+  SELECT 
+    DATE(created_at) as date,
+    COUNT(*) as count,
+    AVG(amount) as avg_amount
+  FROM transactions
+  WHERE created_at >= NOW() - INTERVAL 90 DAY
+  GROUP BY DATE(created_at)
+`);
+```
+
+## Query Performance Monitoring
+
+Track query performance to identify slow queries and connection issues:
+
+```typescript
+import { withResilience } from '@oldwhisper/resilience';
+
+interface QueryMetrics {
+  totalQueries: number;
+  successfulQueries: number;
+  failedQueries: number;
+  totalRetries: number;
+  avgResponseTime: number;
+  slowQueries: number;
+}
+
+const metrics: QueryMetrics = {
+  totalQueries: 0,
+  successfulQueries: 0,
+  failedQueries: 0,
+  totalRetries: 0,
+  avgResponseTime: 0,
+  slowQueries: 0
+};
+
+class ResilientDatabase {
+  constructor(private db: DbClient) {}
+  
+  query = withResilience(
+    async (sql: string, params?: any[]) => {
+      return await this.db.query(sql, params);
+    },
+    {
+      name: 'db.query',
+      retries: 3,
+      timeoutMs: 10000,
+      backoff: {
+        type: 'exponential',
+        baseDelayMs: 100,
+        maxDelayMs: 2000,
+        jitter: true
+      },
+      retryOn: (error: any) => error.message?.includes('connection'),
+      useAbortSignal: true,
+      hooks: {
+        onAttempt: ({ attempt }) => {
+          if (attempt === 1) metrics.totalQueries++;
+        },
+        onSuccess: ({ timeMs }) => {
+          metrics.successfulQueries++;
+          
+          // Update average response time
+          const total = metrics.avgResponseTime * (metrics.successfulQueries - 1);
+          metrics.avgResponseTime = (total + timeMs) / metrics.successfulQueries;
+          
+          // Track slow queries (> 1 second)
+          if (timeMs > 1000) {
+            metrics.slowQueries++;
+            console.warn(`⚠️ Slow query detected: ${timeMs}ms`);
+          }
+        },
+        onFailure: () => {
+          metrics.failedQueries++;
+        },
+        onRetry: ({ attempt }) => {
+          metrics.totalRetries++;
+          console.log(`Retrying query (attempt ${attempt})...`);
+        }
+      }
+    }
+  );
+  
+  getMetrics(): QueryMetrics {
+    return { ...metrics };
+  }
+}
+
+const resilientDb = new ResilientDatabase(myDbClient);
+
+// Run queries
+await resilientDb.query('SELECT * FROM users');
+await resilientDb.query('SELECT * FROM products');
+
+// Check metrics
+const stats = resilientDb.getMetrics();
+console.log('Database Metrics:', {
+  totalQueries: stats.totalQueries,
+  successRate: (stats.successfulQueries / stats.totalQueries * 100).toFixed(2) + '%',
+  avgResponseTime: stats.avgResponseTime.toFixed(2) + 'ms',
+  slowQueries: stats.slowQueries,
+  retries: stats.totalRetries
+});
+```
+
+## Best Practices
+
+- **Use shorter timeouts for OLTP queries** (5-10 seconds) and longer timeouts for analytics (1-2 minutes)
+- **Wrap transactions as a whole**, not individual queries within them
+- **Only retry on transient errors** like connection issues and deadlocks, not data validation errors
+- **Use circuit breakers** to prevent connection pool exhaustion during database outages
+- **Monitor query performance** to identify slow queries and optimize indexes
+- **Implement read replica fallback** for read-heavy workloads
+- **Use exponential backoff with jitter** to avoid thundering herd when database recovers
+- **Set lower retry counts for write operations** to avoid duplicate writes
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="HTTP Retries" icon="globe" href="/examples/http-retries">
+    Learn how to add resilience to HTTP requests
+  </Card>
+  
+  <Card title="Rate Limiting" icon="gauge" href="/examples/rate-limiting">
+    Implement client-side rate limiting strategies
+  </Card>
+</CardGroup>

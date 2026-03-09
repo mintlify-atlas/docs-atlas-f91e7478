@@ -1,0 +1,313 @@
+---
+title: Timeouts
+description: Prevent operations from hanging indefinitely with automatic timeout handling
+---
+
+## Why Timeouts Matter
+
+Without timeouts, a single hanging operation can:
+
+- **Tie up resources**: Threads, connections, and memory remain allocated
+- **Degrade user experience**: Users wait indefinitely with no feedback
+- **Cascade failures**: Blocked operations can cause system-wide congestion
+- **Prevent recovery**: Retries can't happen if the original attempt never completes
+
+Timeouts act as a safety mechanism that guarantees your operations complete (either successfully or with an error) within a predictable timeframe.
+
+<Warning>
+  Set timeouts based on realistic expectations for your operation's duration. Too short causes false failures; too long defeats the purpose.
+</Warning>
+
+## How Timeouts Work in Resilience
+
+The Resilience library implements timeouts using a race between your operation and a timeout timer. Whichever completes first determines the outcome.
+
+From `src/index.ts:93-108`:
+
+```typescript
+async function withTimeout<T>(
+    p: Promise<T>,
+    timeoutMs?: number,
+    controller?: AbortController
+): Promise<T> {
+    if (!timeoutMs) return p;
+    return await Promise.race([
+        p,
+        new Promise<T>((_, reject) =>
+            setTimeout(() => {
+                controller?.abort();
+                reject(new Error("TimeoutError"));
+            }, timeoutMs)
+        ),
+    ]);
+}
+```
+
+### Key Implementation Details
+
+1. **Promise.race**: The operation competes with a timeout promise
+2. **Automatic rejection**: After `timeoutMs`, the timeout promise rejects with `"TimeoutError"`
+3. **Optional abort**: If an `AbortController` is provided, it's aborted when the timeout fires
+4. **No overhead when disabled**: If `timeoutMs` is not set, the original promise is returned unchanged
+
+## Configuration
+
+### Basic Timeout
+
+```typescript
+import { withResilience } from '@oldwhisper/resilience';
+
+const resilient = withResilience(fetchData, {
+  timeoutMs: 5000  // Fail after 5 seconds
+});
+
+try {
+  const result = await resilient();
+  console.log('Completed within timeout:', result);
+} catch (err) {
+  if (err.message === 'TimeoutError') {
+    console.error('Operation timed out after 5s');
+  }
+}
+```
+
+### Timeout with Retries
+
+Timeouts work seamlessly with retries. Each retry attempt gets its own timeout window:
+
+```typescript
+const resilient = withResilience(apiCall, {
+  timeoutMs: 3000,   // Each attempt times out after 3s
+  retries: 2,        // Try up to 3 times
+  retryOn: (err) => err.message === 'TimeoutError'
+});
+
+// Total maximum time: up to 9 seconds (3 attempts × 3s each)
+// Plus any backoff delays between retries
+```
+
+<Note>
+  The timeout applies **per attempt**, not to the total operation. With retries and backoff, the total time can exceed `timeoutMs`.
+</Note>
+
+## Abort Signal Integration
+
+Resilience supports automatic cancellation via `AbortSignal` when timeouts occur. This allows your operations to clean up resources and stop work immediately.
+
+### Enabling Abort Signals
+
+```typescript
+const resilient = withResilience(fetchData, {
+  timeoutMs: 5000,
+  useAbortSignal: true  // Enable automatic cancellation
+});
+```
+
+When enabled, Resilience creates an `AbortController` for each attempt and passes its signal to your function (from `src/index.ts:140-144`):
+
+```typescript
+const controller = config.useAbortSignal ? new AbortController() : undefined;
+const result = await runWithActiveSignal(controller?.signal, async () => {
+    const execPromise = Promise.resolve(fn(...args)) as Promise<Awaited<ReturnType<Fn>>>;
+    return await withTimeout(execPromise, config.timeoutMs, controller);
+});
+```
+
+### Active Signal Context
+
+Resilience maintains an "active signal" that's accessible to your wrapped functions. This enables automatic cancellation throughout your call stack without manual signal propagation.
+
+From `src/index.ts:8-21`:
+
+```typescript
+let activeSignal: AbortSignal | undefined;
+
+async function runWithActiveSignal<T>(signal: AbortSignal | undefined, fn: () => Promise<T>) {
+    const prev = activeSignal;
+    activeSignal = signal;
+    try {
+        return await fn();
+    } finally {
+        activeSignal = prev;
+    }
+}
+```
+
+### Using the Active Signal
+
+Resilience provides helper functions that automatically use the active abort signal:
+
+<CodeGroup>
+
+```typescript resilientFetch
+import { withResilience, resilientFetch } from '@oldwhisper/resilience';
+
+const fetchUser = async (id: string) => {
+  // resilientFetch automatically uses the active signal
+  const response = await resilientFetch(`https://api.example.com/users/${id}`);
+  return response.json();
+};
+
+const resilient = withResilience(fetchUser, {
+  timeoutMs: 3000,
+  useAbortSignal: true
+});
+
+// If the timeout fires, the fetch will be automatically cancelled
+await resilient('user-123');
+```
+
+```typescript sleep
+import { withResilience, sleep } from '@oldwhisper/resilience';
+
+const processWithDelay = async () => {
+  console.log('Starting...');
+  
+  // sleep uses the active signal by default
+  await sleep(2000);  // Will be cancelled if timeout fires
+  
+  console.log('Finished after delay');
+};
+
+const resilient = withResilience(processWithDelay, {
+  timeoutMs: 1000,    // Times out before sleep completes
+  useAbortSignal: true
+});
+
+try {
+  await resilient();
+} catch (err) {
+  console.log('Aborted:', err.message);  // "Aborted"
+}
+```
+
+```typescript Manual Signal
+import { withResilience } from '@oldwhisper/resilience';
+
+const customOperation = async (signal?: AbortSignal) => {
+  // You can also accept the signal explicitly
+  const response = await fetch('https://api.example.com/data', { signal });
+  return response.json();
+};
+
+// But with useAbortSignal, you don't need to pass it manually
+const resilient = withResilience(customOperation, {
+  timeoutMs: 5000,
+  useAbortSignal: true
+});
+```
+
+</CodeGroup>
+
+The `resilientFetch` implementation (from `src/index.ts:197-201`):
+
+```typescript
+export const resilientFetch = (input: RequestInfo | URL, init?: RequestInit) => {
+    const signal = init?.signal ?? activeSignal;
+    if (!signal) return fetch(input, init);
+    return fetch(input, { ...init, signal });
+};
+```
+
+## Complete Example
+
+```typescript
+import { withResilience, resilientFetch } from '@oldwhisper/resilience';
+
+interface User {
+  id: string;
+  name: string;
+}
+
+async function fetchUserProfile(userId: string): Promise<User> {
+  // Use resilientFetch for automatic abort signal support
+  const response = await resilientFetch(`https://api.example.com/users/${userId}`);
+  
+  if (!response.ok) {
+    throw new Error(`HTTP ${response.status}`);
+  }
+  
+  return response.json();
+}
+
+const resilientFetch = withResilience(fetchUserProfile, {
+  name: 'fetchUserProfile',
+  timeoutMs: 3000,        // Timeout after 3 seconds
+  useAbortSignal: true,   // Cancel the fetch if timeout fires
+  retries: 2,             // Retry up to 2 times
+  backoff: {
+    type: 'exponential',
+    baseDelayMs: 500,
+    maxDelayMs: 2000
+  },
+  retryOn: (err) => {
+    // Retry on timeouts and server errors
+    return err.message === 'TimeoutError' || 
+           err.message.includes('HTTP 5');
+  },
+  hooks: {
+    onFailure: ({ attempt, timeMs, error }) => {
+      if (error.message === 'TimeoutError') {
+        console.warn(`Attempt ${attempt} timed out after ${timeMs}ms`);
+      }
+    }
+  }
+});
+
+// Usage
+try {
+  const user = await resilientFetch('user-123');
+  console.log('User:', user.name);
+} catch (error) {
+  console.error('Failed after all retries:', error);
+}
+```
+
+## Timeout Error Detection
+
+Timeout errors are identifiable by their error message:
+
+```typescript
+try {
+  await resilient();
+} catch (err) {
+  if (err.message === 'TimeoutError') {
+    // Handle timeout specifically
+    console.error('Operation exceeded time limit');
+  } else {
+    // Handle other errors
+    console.error('Operation failed:', err);
+  }
+}
+```
+
+You can use this in `retryOn` to control retry behavior:
+
+```typescript
+const resilient = withResilience(task, {
+  timeoutMs: 5000,
+  retries: 3,
+  retryOn: (err) => {
+    // Retry timeouts, but not other errors
+    return err.message === 'TimeoutError';
+  }
+});
+```
+
+## Best Practices
+
+1. **Set realistic timeouts**: Base them on percentile latencies (e.g., P95 or P99) from monitoring data
+2. **Always enable `useAbortSignal`**: Allows proper cleanup and prevents wasted resources
+3. **Use `resilientFetch` and `sleep`**: These helpers automatically respect abort signals
+4. **Monitor timeout rates**: High timeout rates indicate systemic issues, not just transient failures
+5. **Combine with retries**: Timeouts work best when paired with retries and backoff
+
+<Info>
+  When using `useAbortSignal: true`, operations that respect the abort signal will stop immediately when the timeout fires, preventing unnecessary work.
+</Info>
+
+## Related Concepts
+
+- [Retries](/concepts/retries) - Automatically retry timed-out operations
+- [Backoff Strategies](/concepts/backoff) - Control delays between retry attempts
+- [Circuit Breakers](/concepts/circuit-breaker) - Prevent cascading timeouts when a service is down

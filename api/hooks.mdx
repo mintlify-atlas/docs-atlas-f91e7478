@@ -1,0 +1,576 @@
+---
+title: 'Hooks'
+description: 'Lifecycle hooks for observability, metrics, and monitoring'
+---
+
+## Overview
+
+Resilience hooks provide callbacks at key points in the execution lifecycle, enabling metrics collection, logging, alerting, and custom behavior. All hooks are optional and receive detailed context about the execution.
+
+## ResilienceHooks Type
+
+```typescript
+type ResilienceHooks = {
+  onAttempt?: (info: { name: string; attempt: number }) => void;
+  onSuccess?: (info: { name: string; attempt: number; timeMs: number }) => void;
+  onFailure?: (info: { name: string; attempt: number; timeMs: number; error: unknown }) => void;
+  onRetry?: (info: { name: string; attempt: number; delayMs: number; error: unknown }) => void;
+  onCircuitOpen?: (info: { name: string }) => void;
+  onCircuitHalfOpen?: (info: { name: string }) => void;
+  onCircuitClosed?: (info: { name: string }) => void;
+}
+```
+
+Defined in `src/global.d.ts:24-32`.
+
+## Hook Reference
+
+### onAttempt
+
+Called at the start of each execution attempt, before the function runs.
+
+```typescript
+onAttempt?: (info: { name: string; attempt: number }) => void
+```
+
+<ParamField path="info.name" type="string">
+  Name of the function being executed.
+</ParamField>
+
+<ParamField path="info.attempt" type="number">
+  Current attempt number (1-based). First attempt is `1`, first retry is `2`, etc.
+</ParamField>
+
+**When called**: Before every execution attempt, including initial and retries.
+
+**Use cases**:
+- Increment attempt counters
+- Log execution attempts
+- Track in-flight requests
+
+**Example**:
+
+```typescript
+hooks: {
+  onAttempt: ({ name, attempt }) => {
+    metrics.increment(`${name}.attempts`, { attempt });
+    logger.debug(`[${name}] Starting attempt ${attempt}`);
+  }
+}
+```
+
+**Implementation location**: `src/index.ts:130`
+
+### onSuccess
+
+Called when a function execution completes successfully.
+
+```typescript
+onSuccess?: (info: { name: string; attempt: number; timeMs: number }) => void
+```
+
+<ParamField path="info.name" type="string">
+  Name of the function that succeeded.
+</ParamField>
+
+<ParamField path="info.attempt" type="number">
+  The attempt number that succeeded (1 if succeeded on first try).
+</ParamField>
+
+<ParamField path="info.timeMs" type="number">
+  Execution time in milliseconds for this successful attempt.
+</ParamField>
+
+**When called**: After successful execution, before returning the result.
+
+**Use cases**:
+- Record success metrics
+- Track execution time histograms
+- Log successful operations
+- Update circuit breaker state
+
+**Example**:
+
+```typescript
+hooks: {
+  onSuccess: ({ name, attempt, timeMs }) => {
+    metrics.recordTiming(`${name}.duration`, timeMs);
+    metrics.increment(`${name}.success`, { attempt });
+    
+    if (attempt > 1) {
+      logger.info(`[${name}] Succeeded on attempt ${attempt} after ${timeMs}ms`);
+    }
+  }
+}
+```
+
+**Implementation location**: `src/index.ts:148`
+
+### onFailure
+
+Called when a function execution fails.
+
+```typescript
+onFailure?: (info: { name: string; attempt: number; timeMs: number; error: unknown }) => void
+```
+
+<ParamField path="info.name" type="string">
+  Name of the function that failed.
+</ParamField>
+
+<ParamField path="info.attempt" type="number">
+  The attempt number that failed.
+</ParamField>
+
+<ParamField path="info.timeMs" type="number">
+  Execution time in milliseconds before failure.
+</ParamField>
+
+<ParamField path="info.error" type="unknown">
+  The error that was thrown. Can be any type (Error, string, object, etc.).
+</ParamField>
+
+**When called**: After every failed execution attempt, regardless of whether it will be retried.
+
+**Use cases**:
+- Record failure metrics
+- Log errors
+- Track error types
+- Send alerts for repeated failures
+- Update circuit breaker state
+
+**Example**:
+
+```typescript
+hooks: {
+  onFailure: ({ name, attempt, timeMs, error }) => {
+    metrics.increment(`${name}.failure`, { attempt });
+    
+    const errorType = error instanceof Error ? error.constructor.name : typeof error;
+    metrics.increment(`${name}.error_type`, { type: errorType });
+    
+    logger.error(`[${name}] Attempt ${attempt} failed after ${timeMs}ms:`, error);
+    
+    // Alert on final failure
+    if (attempt === maxRetries + 1) {
+      alerts.send(`${name} failed after ${attempt} attempts`, error);
+    }
+  }
+}
+```
+
+**Implementation location**: `src/index.ts:155`
+
+### onRetry
+
+Called when a retry will be attempted after a failure.
+
+```typescript
+onRetry?: (info: { name: string; attempt: number; delayMs: number; error: unknown }) => void
+```
+
+<ParamField path="info.name" type="string">
+  Name of the function being retried.
+</ParamField>
+
+<ParamField path="info.attempt" type="number">
+  The attempt number that just failed (the next attempt will be `attempt + 1`).
+</ParamField>
+
+<ParamField path="info.delayMs" type="number">
+  The backoff delay in milliseconds before the next retry.
+</ParamField>
+
+<ParamField path="info.error" type="unknown">
+  The error that triggered the retry.
+</ParamField>
+
+**When called**: After a failed attempt when a retry will occur, before the backoff delay.
+
+**Use cases**:
+- Log retry decisions
+- Track retry frequency
+- Monitor backoff delays
+- Debug retry behavior
+
+**Example**:
+
+```typescript
+hooks: {
+  onRetry: ({ name, attempt, delayMs, error }) => {
+    metrics.increment(`${name}.retry`, { attempt });
+    metrics.recordValue(`${name}.retry_delay`, delayMs);
+    
+    logger.warn(
+      `[${name}] Retrying after attempt ${attempt} ` +
+      `(waiting ${delayMs}ms) due to:`,
+      error
+    );
+  }
+}
+```
+
+**Implementation location**: `src/index.ts:161`
+
+### onCircuitOpen
+
+Called when the circuit breaker opens due to excessive failures.
+
+```typescript
+onCircuitOpen?: (info: { name: string }) => void
+```
+
+<ParamField path="info.name" type="string">
+  Name of the function whose circuit opened.
+</ParamField>
+
+**When called**: When failure count reaches `circuitBreaker.failureThreshold`.
+
+**Use cases**:
+- Send critical alerts
+- Trigger fallback mechanisms
+- Update service health status
+- Log circuit breaker events
+
+**Example**:
+
+```typescript
+hooks: {
+  onCircuitOpen: ({ name }) => {
+    metrics.increment(`${name}.circuit_open`);
+    logger.error(`[${name}] Circuit breaker OPENED - all requests will be rejected`);
+    
+    alerts.send({
+      severity: 'critical',
+      message: `Circuit breaker opened for ${name}`,
+      action: 'All requests will be rejected until reset timeout'
+    });
+    
+    // Update service health
+    healthCheck.markDegraded(name);
+  }
+}
+```
+
+**Implementation location**: `src/index.ts:64`
+
+### onCircuitHalfOpen
+
+Called when the circuit breaker enters half-open state for testing.
+
+```typescript
+onCircuitHalfOpen?: (info: { name: string }) => void
+```
+
+<ParamField path="info.name" type="string">
+  Name of the function whose circuit is being tested.
+</ParamField>
+
+**When called**: After `circuitBreaker.resetTimeoutMs` has elapsed since circuit opened.
+
+**Use cases**:
+- Log circuit breaker state changes
+- Track recovery attempts
+- Monitor circuit health
+
+**Example**:
+
+```typescript
+hooks: {
+  onCircuitHalfOpen: ({ name }) => {
+    metrics.increment(`${name}.circuit_half_open`);
+    logger.info(`[${name}] Circuit breaker HALF-OPEN - testing with probe request`);
+  }
+}
+```
+
+**Implementation location**: `src/index.ts:45`
+
+### onCircuitClosed
+
+Called when the circuit breaker closes after successful recovery.
+
+```typescript
+onCircuitClosed?: (info: { name: string }) => void
+```
+
+<ParamField path="info.name" type="string">
+  Name of the function whose circuit closed.
+</ParamField>
+
+**When called**: 
+- After a successful execution when circuit was in HALF_OPEN state
+- When transitioning from any non-CLOSED state to CLOSED
+
+**Use cases**:
+- Send recovery notifications
+- Log circuit breaker recovery
+- Update service health status
+- Clear alerts
+
+**Example**:
+
+```typescript
+hooks: {
+  onCircuitClosed: ({ name }) => {
+    metrics.increment(`${name}.circuit_closed`);
+    logger.info(`[${name}] Circuit breaker CLOSED - normal operation resumed`);
+    
+    alerts.resolve({
+      message: `Circuit breaker recovered for ${name}`,
+      action: 'Normal operation resumed'
+    });
+    
+    // Update service health
+    healthCheck.markHealthy(name);
+  }
+}
+```
+
+**Implementation location**: `src/index.ts:54`
+
+## Hook Execution Flow
+
+For a function with 3 retries and circuit breaker:
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    Start Execution                          │
+└─────────────────────────────────────────────────────────────┘
+                          │
+                          ▼
+                   ┌─────────────┐
+                   │ onAttempt(1)│
+                   └─────────────┘
+                          │
+                          ▼
+                   ┌─────────────┐
+                   │   Execute   │
+                   └─────────────┘
+                    /           \
+                   /             \
+            Success            Failure
+               │                 │
+               ▼                 ▼
+        ┌──────────┐      ┌──────────────┐
+        │onSuccess │      │  onFailure(1)│
+        └──────────┘      └──────────────┘
+               │                 │
+               │                 ▼
+               │          ┌──────────────┐
+               │          │  onRetry(1)  │
+               │          └──────────────┘
+               │                 │
+               │                 ▼
+               │           (backoff delay)
+               │                 │
+               │                 ▼
+               │          ┌─────────────┐
+               │          │ onAttempt(2)│
+               │          └─────────────┘
+               │                 │
+               │               (repeat)
+               │                 │
+               │        After N failures:
+               │                 │
+               │                 ▼
+               │         ┌──────────────┐
+               │         │onCircuitOpen │
+               │         └──────────────┘
+               │                 │
+               │          (wait resetTimeout)
+               │                 │
+               │                 ▼
+               │      ┌──────────────────┐
+               │      │onCircuitHalfOpen │
+               │      └──────────────────┘
+               │                 │
+               │          ┌─────────────┐
+               │          │ onAttempt(N)│
+               │          └─────────────┘
+               │            /        \
+               │       Success    Failure
+               │          /            \
+               ▼         ▼              ▼
+        ┌──────────────────┐    ┌──────────────┐
+        │ onCircuitClosed  │    │onCircuitOpen │
+        └──────────────────┘    └──────────────┘
+```
+
+## Complete Hooks Example
+
+```typescript
+import { withResilience } from '@your-org/resilience';
+import { logger, metrics, alerts } from './monitoring';
+
+const resilientFunction = withResilience(
+  async (data: any) => {
+    return await processData(data);
+  },
+  {
+    name: 'data-processor',
+    retries: 3,
+    timeoutMs: 5000,
+    circuitBreaker: {
+      failureThreshold: 5,
+      resetTimeoutMs: 60000
+    },
+    hooks: {
+      onAttempt: ({ name, attempt }) => {
+        metrics.increment(`${name}.attempts`, { attempt });
+        logger.debug(`[${name}] Attempt ${attempt}`);
+      },
+      
+      onSuccess: ({ name, attempt, timeMs }) => {
+        metrics.recordTiming(`${name}.duration`, timeMs);
+        metrics.increment(`${name}.success`, { attempt });
+        
+        if (attempt > 1) {
+          logger.info(
+            `[${name}] Succeeded on attempt ${attempt} after ${timeMs}ms`
+          );
+        }
+      },
+      
+      onFailure: ({ name, attempt, timeMs, error }) => {
+        metrics.increment(`${name}.failure`, { attempt });
+        
+        const errorType = error instanceof Error 
+          ? error.constructor.name 
+          : typeof error;
+        metrics.increment(`${name}.error_type.${errorType}`);
+        
+        logger.error(
+          `[${name}] Attempt ${attempt} failed after ${timeMs}ms:`,
+          error
+        );
+      },
+      
+      onRetry: ({ name, attempt, delayMs, error }) => {
+        metrics.increment(`${name}.retry`, { attempt });
+        metrics.recordValue(`${name}.retry_delay`, delayMs);
+        
+        logger.warn(
+          `[${name}] Retrying after attempt ${attempt} ` +
+          `(waiting ${delayMs}ms) due to:`,
+          error
+        );
+      },
+      
+      onCircuitOpen: ({ name }) => {
+        metrics.increment(`${name}.circuit_open`);
+        
+        logger.error(
+          `[${name}] Circuit breaker OPENED - ` +
+          `rejecting all requests`
+        );
+        
+        alerts.send({
+          severity: 'critical',
+          title: `Circuit breaker opened: ${name}`,
+          message: 'All requests will be rejected until recovery'
+        });
+      },
+      
+      onCircuitHalfOpen: ({ name }) => {
+        metrics.increment(`${name}.circuit_half_open`);
+        
+        logger.info(
+          `[${name}] Circuit breaker HALF-OPEN - ` +
+          `testing recovery`
+        );
+      },
+      
+      onCircuitClosed: ({ name }) => {
+        metrics.increment(`${name}.circuit_closed`);
+        
+        logger.info(
+          `[${name}] Circuit breaker CLOSED - ` +
+          `normal operation resumed`
+        );
+        
+        alerts.resolve({
+          title: `Circuit breaker recovered: ${name}`,
+          message: 'Normal operation resumed'
+        });
+      }
+    }
+  }
+);
+```
+
+## Common Patterns
+
+### Metrics Collection
+
+```typescript
+const metricsHooks = {
+  onAttempt: ({ name }) => {
+    metrics.increment(`${name}.attempt`);
+  },
+  onSuccess: ({ name, timeMs }) => {
+    metrics.recordTiming(`${name}.duration`, timeMs);
+    metrics.increment(`${name}.success`);
+  },
+  onFailure: ({ name }) => {
+    metrics.increment(`${name}.failure`);
+  }
+};
+```
+
+### Structured Logging
+
+```typescript
+const loggingHooks = {
+  onAttempt: ({ name, attempt }) => {
+    logger.debug({ fn: name, attempt }, 'Function attempt');
+  },
+  onSuccess: ({ name, attempt, timeMs }) => {
+    logger.info({ fn: name, attempt, timeMs }, 'Function succeeded');
+  },
+  onFailure: ({ name, attempt, error }) => {
+    logger.error({ fn: name, attempt, err: error }, 'Function failed');
+  }
+};
+```
+
+### Alerting on Critical Failures
+
+```typescript
+const alertingHooks = {
+  onCircuitOpen: ({ name }) => {
+    pagerDuty.trigger({
+      severity: 'critical',
+      summary: `Circuit breaker opened for ${name}`
+    });
+  },
+  onCircuitClosed: ({ name }) => {
+    pagerDuty.resolve({ summary: `Circuit recovered for ${name}` });
+  }
+};
+```
+
+### Tracing and Observability
+
+```typescript
+const tracingHooks = {
+  onAttempt: ({ name, attempt }) => {
+    const span = tracer.startSpan(`${name}.attempt.${attempt}`);
+    span.setAttribute('attempt', attempt);
+  },
+  onSuccess: ({ name, timeMs }) => {
+    tracer.getCurrentSpan()?.end();
+  },
+  onFailure: ({ name, error }) => {
+    const span = tracer.getCurrentSpan();
+    span?.recordException(error);
+    span?.end();
+  }
+};
+```
+
+## Related
+
+- [WrapperInit](/api/wrapper-init) - Helper class with built-in hooks
+- [Configuration](/api/configuration) - See the `hooks` configuration option
+- [withResilience](/api/with-resilience) - Main function that uses hooks

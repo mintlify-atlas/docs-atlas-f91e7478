@@ -1,0 +1,337 @@
+---
+title: "HTTP Retries"
+description: "Implement robust HTTP clients with automatic retry logic and exponential backoff"
+---
+
+## Overview
+
+HTTP requests often fail due to temporary network issues, rate limits, or server hiccups. The Resilience library helps you build robust HTTP clients that automatically retry failed requests with exponential backoff.
+
+## Basic HTTP Retry Pattern
+
+Use `resilientFetch` with `withResilience` to automatically handle transient network errors:
+
+```typescript
+import { withResilience, resilientFetch } from '@oldwhisper/resilience';
+
+// Wrap your API call with retry logic
+const fetchUserData = withResilience(
+  async (userId: string) => {
+    const response = await resilientFetch(`https://api.example.com/users/${userId}`);
+    
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+    }
+    
+    return response.json();
+  },
+  {
+    name: 'fetchUserData',
+    retries: 3,
+    timeoutMs: 5000,
+    backoff: {
+      type: 'exponential',
+      baseDelayMs: 1000,
+      maxDelayMs: 10000,
+      jitter: true  // Adds randomness to prevent thundering herd
+    },
+    // Only retry on network errors or 5xx server errors
+    retryOn: (error) => {
+      if (error instanceof Error && error.message.includes('HTTP 5')) {
+        return true;
+      }
+      return error instanceof TypeError; // Network errors are TypeErrors
+    },
+    useAbortSignal: true  // Enables timeout cancellation
+  }
+);
+
+// Use it like a normal async function
+try {
+  const user = await fetchUserData('user-123');
+  console.log('User data:', user);
+} catch (error) {
+  console.error('Failed after retries:', error);
+}
+```
+
+<Note>
+  The `resilientFetch` function automatically uses the abort signal from `withResilience` when `useAbortSignal` is enabled, ensuring requests are cancelled on timeout.
+</Note>
+
+## API Client with Multiple Endpoints
+
+Create a complete API client class with resilience built in:
+
+```typescript
+import { withResilience, resilientFetch } from '@oldwhisper/resilience';
+
+class ApiClient {
+  private baseUrl: string;
+  
+  constructor(baseUrl: string) {
+    this.baseUrl = baseUrl;
+  }
+  
+  // GET request with retries
+  get = withResilience(
+    async (endpoint: string) => {
+      const response = await resilientFetch(`${this.baseUrl}${endpoint}`);
+      if (!response.ok) throw new Error(`GET failed: ${response.status}`);
+      return response.json();
+    },
+    {
+      name: 'api.get',
+      retries: 3,
+      timeoutMs: 10000,
+      backoff: {
+        type: 'exponential',
+        baseDelayMs: 500,
+        maxDelayMs: 5000,
+        jitter: true
+      },
+      retryOn: (error) => {
+        // Retry on network errors and 5xx, but not 4xx client errors
+        if (error instanceof Error) {
+          return error.message.includes('HTTP 5') || 
+                 error.message.includes('network') ||
+                 error.name === 'TypeError';
+        }
+        return false;
+      },
+      useAbortSignal: true
+    }
+  );
+  
+  // POST request with retries (more conservative)
+  post = withResilience(
+    async (endpoint: string, data: any) => {
+      const response = await resilientFetch(`${this.baseUrl}${endpoint}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(data)
+      });
+      if (!response.ok) throw new Error(`POST failed: ${response.status}`);
+      return response.json();
+    },
+    {
+      name: 'api.post',
+      retries: 1,  // Fewer retries for mutations
+      timeoutMs: 15000,
+      backoff: {
+        type: 'fixed',
+        delayMs: 1000
+      },
+      retryOn: (error) => {
+        // Only retry on explicit network failures for POST
+        return error instanceof TypeError;
+      },
+      useAbortSignal: true
+    }
+  );
+}
+
+// Usage
+const api = new ApiClient('https://api.example.com');
+
+const users = await api.get('/users');
+const newUser = await api.post('/users', { name: 'Alice', email: 'alice@example.com' });
+```
+
+## Advanced: Rate Limit Handling
+
+<Tabs>
+  <Tab title="Exponential Backoff">
+    Handle rate limits with exponential backoff that respects `Retry-After` headers:
+
+    ```typescript
+    import { withResilience, resilientFetch } from '@oldwhisper/resilience';
+
+    const fetchWithRateLimit = withResilience(
+      async (url: string) => {
+        const response = await resilientFetch(url);
+        
+        if (response.status === 429) {
+          // Extract Retry-After if available
+          const retryAfter = response.headers.get('Retry-After');
+          const error: any = new Error('Rate limit exceeded');
+          error.retryAfter = retryAfter ? parseInt(retryAfter) * 1000 : undefined;
+          throw error;
+        }
+        
+        if (!response.ok) {
+          throw new Error(`HTTP ${response.status}`);
+        }
+        
+        return response.json();
+      },
+      {
+        name: 'fetchWithRateLimit',
+        retries: 5,
+        timeoutMs: 30000,
+        backoff: {
+          type: 'exponential',
+          baseDelayMs: 2000,
+          maxDelayMs: 30000,
+          jitter: true
+        },
+        retryOn: (error: any) => {
+          // Retry on rate limits and server errors
+          return error.message?.includes('429') || 
+                 error.message?.includes('HTTP 5');
+        },
+        useAbortSignal: true
+      }
+    );
+
+    try {
+      const data = await fetchWithRateLimit('https://api.github.com/user');
+      console.log('Success:', data);
+    } catch (error) {
+      console.error('Failed:', error);
+    }
+    ```
+  </Tab>
+  
+  <Tab title="Circuit Breaker">
+    Use a circuit breaker to prevent cascading failures when an API is down:
+
+    ```typescript
+    import { withResilience, resilientFetch } from '@oldwhisper/resilience';
+
+    const fetchWithCircuitBreaker = withResilience(
+      async (url: string) => {
+        const response = await resilientFetch(url);
+        if (!response.ok) {
+          throw new Error(`HTTP ${response.status}`);
+        }
+        return response.json();
+      },
+      {
+        name: 'fetchWithCircuitBreaker',
+        retries: 2,
+        timeoutMs: 5000,
+        backoff: {
+          type: 'exponential',
+          baseDelayMs: 1000,
+          maxDelayMs: 5000
+        },
+        circuitBreaker: {
+          failureThreshold: 3,  // Open circuit after 3 failures
+          resetTimeoutMs: 30000  // Try again after 30 seconds
+        },
+        retryOn: (error) => true,
+        useAbortSignal: true,
+        hooks: {
+          onCircuitOpen: ({ name }) => {
+            console.warn(`⚠️ Circuit opened for ${name} - too many failures`);
+          },
+          onCircuitHalfOpen: ({ name }) => {
+            console.info(`🔄 Circuit half-open for ${name} - trying again`);
+          },
+          onCircuitClosed: ({ name }) => {
+            console.info(`✅ Circuit closed for ${name} - back to normal`);
+          }
+        }
+      }
+    );
+
+    // When the API is down, requests will fail fast after the threshold
+    for (let i = 0; i < 10; i++) {
+      try {
+        await fetchWithCircuitBreaker('https://unreliable-api.example.com/data');
+      } catch (error) {
+        console.error(`Request ${i + 1} failed:`, error.message);
+      }
+    }
+    ```
+  </Tab>
+</Tabs>
+
+<Tip>
+  For production APIs, combine exponential backoff with jitter and circuit breakers to handle both transient failures and prolonged outages gracefully.
+</Tip>
+
+## Monitoring HTTP Calls
+
+Track HTTP request metrics to understand reliability:
+
+```typescript
+import { withResilience, resilientFetch } from '@oldwhisper/resilience';
+
+const metrics = {
+  attempts: 0,
+  successes: 0,
+  failures: 0,
+  retries: 0
+};
+
+const monitoredFetch = withResilience(
+  async (url: string) => {
+    const response = await resilientFetch(url);
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    return response.json();
+  },
+  {
+    name: 'monitoredFetch',
+    retries: 3,
+    timeoutMs: 5000,
+    backoff: {
+      type: 'exponential',
+      baseDelayMs: 1000,
+      maxDelayMs: 10000,
+      jitter: true
+    },
+    retryOn: (error) => true,
+    useAbortSignal: true,
+    hooks: {
+      onAttempt: ({ attempt }) => {
+        metrics.attempts++;
+        console.log(`Attempt ${attempt}`);
+      },
+      onSuccess: ({ attempt, timeMs }) => {
+        metrics.successes++;
+        console.log(`✓ Success on attempt ${attempt} (${timeMs}ms)`);
+      },
+      onFailure: ({ attempt, error }) => {
+        metrics.failures++;
+        console.error(`✗ Failure on attempt ${attempt}:`, error);
+      },
+      onRetry: ({ attempt, delayMs }) => {
+        metrics.retries++;
+        console.log(`⟳ Retrying after ${delayMs}ms...`);
+      }
+    }
+  }
+);
+
+// Use the monitored fetch
+try {
+  await monitoredFetch('https://api.example.com/data');
+} finally {
+  console.log('Metrics:', metrics);
+  // { attempts: 2, successes: 1, failures: 1, retries: 1 }
+}
+```
+
+## Best Practices
+
+- **Use exponential backoff with jitter** for all retry logic to prevent thundering herd problems
+- **Set appropriate timeouts** based on your API's typical response times
+- **Distinguish between retryable and non-retryable errors** (e.g., don't retry 4xx client errors)
+- **Use fewer retries for mutations** (POST, PUT, DELETE) to avoid duplicate operations
+- **Enable circuit breakers** for critical dependencies to fail fast during outages
+- **Monitor retry metrics** to identify flaky endpoints and optimize retry strategies
+- **Always use `useAbortSignal: true`** to ensure timeouts properly cancel network requests
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Database Operations" icon="database" href="/examples/database-operations">
+    Learn how to add resilience to database queries
+  </Card>
+  
+  <Card title="Rate Limiting" icon="gauge" href="/examples/rate-limiting">
+    Implement client-side rate limiting strategies
+  </Card>
+</CardGroup>

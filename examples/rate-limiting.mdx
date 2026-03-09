@@ -1,0 +1,646 @@
+---
+title: "Rate Limiting"
+description: "Implement client-side rate limiting with backoff strategies and circuit breakers"
+---
+
+## Overview
+
+Rate limiting protects your application from overwhelming external services or being blocked by API rate limits. The Resilience library provides tools to implement intelligent rate limiting with automatic backoff and circuit breakers.
+
+## Basic Rate Limit Handling
+
+Handle HTTP 429 responses with exponential backoff:
+
+```typescript
+import { withResilience, resilientFetch } from '@oldwhisper/resilience';
+
+const rateLimitedFetch = withResilience(
+  async (url: string) => {
+    const response = await resilientFetch(url);
+    
+    // Check for rate limit
+    if (response.status === 429) {
+      const retryAfter = response.headers.get('Retry-After');
+      const error: any = new Error('Rate limit exceeded');
+      error.status = 429;
+      error.retryAfter = retryAfter;
+      throw error;
+    }
+    
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}`);
+    }
+    
+    return response.json();
+  },
+  {
+    name: 'rateLimitedFetch',
+    retries: 5,  // More retries for rate limits
+    timeoutMs: 30000,
+    backoff: {
+      type: 'exponential',
+      baseDelayMs: 2000,  // Start with 2 seconds
+      maxDelayMs: 60000,  // Max 60 seconds
+      jitter: true  // Add randomness to prevent synchronized retries
+    },
+    // Only retry on rate limits and server errors
+    retryOn: (error: any) => {
+      return error.status === 429 || 
+             error.message?.includes('HTTP 5');
+    },
+    useAbortSignal: true,
+    hooks: {
+      onRetry: ({ attempt, delayMs, error }: any) => {
+        const retryAfter = error.retryAfter;
+        if (retryAfter) {
+          console.log(`Rate limited. Retrying after ${retryAfter}s (attempt ${attempt})`);
+        } else {
+          console.log(`Rate limited. Backing off ${delayMs}ms (attempt ${attempt})`);
+        }
+      }
+    }
+  }
+);
+
+// Usage
+try {
+  const data = await rateLimitedFetch('https://api.example.com/data');
+  console.log('Success:', data);
+} catch (error) {
+  console.error('Failed after rate limit retries:', error);
+}
+```
+
+<Note>
+  Always respect the `Retry-After` header when provided by the API. Some APIs will ban clients that ignore this header.
+</Note>
+
+## Token Bucket Rate Limiter
+
+Implement client-side rate limiting using a token bucket algorithm:
+
+```typescript
+import { withResilience, resilientFetch, sleep } from '@oldwhisper/resilience';
+
+/**
+ * Token bucket rate limiter that controls request rate
+ */
+class TokenBucket {
+  private tokens: number;
+  private lastRefill: number;
+  
+  constructor(
+    private capacity: number,  // Max tokens
+    private refillRate: number  // Tokens per second
+  ) {
+    this.tokens = capacity;
+    this.lastRefill = Date.now();
+  }
+  
+  /**
+   * Try to consume a token. Returns true if successful.
+   */
+  tryConsume(): boolean {
+    this.refill();
+    
+    if (this.tokens >= 1) {
+      this.tokens -= 1;
+      return true;
+    }
+    
+    return false;
+  }
+  
+  /**
+   * Wait until a token is available
+   */
+  async consume(): Promise<void> {
+    while (!this.tryConsume()) {
+      // Calculate wait time for next token
+      const waitMs = (1 / this.refillRate) * 1000;
+      await sleep(Math.min(waitMs, 100));  // Check at least every 100ms
+    }
+  }
+  
+  /**
+   * Refill tokens based on elapsed time
+   */
+  private refill(): void {
+    const now = Date.now();
+    const elapsed = (now - this.lastRefill) / 1000;
+    const tokensToAdd = elapsed * this.refillRate;
+    
+    this.tokens = Math.min(this.capacity, this.tokens + tokensToAdd);
+    this.lastRefill = now;
+  }
+  
+  /**
+   * Get current token count
+   */
+  getTokens(): number {
+    this.refill();
+    return this.tokens;
+  }
+}
+
+// Create rate limiter: 10 requests per second, burst of 20
+const rateLimiter = new TokenBucket(20, 10);
+
+const rateLimitedFetch = withResilience(
+  async (url: string) => {
+    // Wait for rate limiter token
+    await rateLimiter.consume();
+    
+    const response = await resilientFetch(url);
+    
+    if (response.status === 429) {
+      throw new Error('Rate limit exceeded despite client-side limiting');
+    }
+    
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}`);
+    }
+    
+    return response.json();
+  },
+  {
+    name: 'rateLimitedFetch',
+    retries: 3,
+    timeoutMs: 10000,
+    backoff: {
+      type: 'exponential',
+      baseDelayMs: 1000,
+      maxDelayMs: 10000,
+      jitter: true
+    },
+    retryOn: (error) => error.message?.includes('Rate limit'),
+    useAbortSignal: true
+  }
+);
+
+// Usage - automatically rate limited
+const promises = [];
+for (let i = 0; i < 100; i++) {
+  promises.push(rateLimitedFetch(`https://api.example.com/items/${i}`));
+}
+
+// Requests will be throttled to 10/second
+const results = await Promise.all(promises);
+console.log(`Completed ${results.length} requests`);
+```
+
+## API Client with Rate Limiting
+
+<Tabs>
+  <Tab title="GitHub API Example">
+    Real-world example for GitHub API (5000 requests/hour):
+
+    ```typescript
+    import { withResilience, resilientFetch } from '@oldwhisper/resilience';
+
+    class GitHubClient {
+      private rateLimiter: TokenBucket;
+      
+      constructor(private token: string) {
+        // GitHub: 5000 requests per hour = ~1.4 requests/second
+        // Set conservative limit with burst capacity
+        this.rateLimiter = new TokenBucket(10, 1.2);
+      }
+      
+      private request = withResilience(
+        async (endpoint: string) => {
+          // Wait for rate limit token
+          await this.rateLimiter.consume();
+          
+          const response = await resilientFetch(
+            `https://api.github.com${endpoint}`,
+            {
+              headers: {
+                'Authorization': `token ${this.token}`,
+                'Accept': 'application/vnd.github.v3+json'
+              }
+            }
+          );
+          
+          // Check rate limit headers
+          const remaining = response.headers.get('X-RateLimit-Remaining');
+          const reset = response.headers.get('X-RateLimit-Reset');
+          
+          if (remaining) {
+            console.log(`Rate limit remaining: ${remaining}`);
+          }
+          
+          if (response.status === 429) {
+            const resetTime = reset ? parseInt(reset) * 1000 : Date.now() + 60000;
+            const waitTime = Math.max(0, resetTime - Date.now());
+            const error: any = new Error('GitHub rate limit exceeded');
+            error.status = 429;
+            error.waitTime = waitTime;
+            throw error;
+          }
+          
+          if (!response.ok) {
+            throw new Error(`GitHub API error: ${response.status}`);
+          }
+          
+          return response.json();
+        },
+        {
+          name: 'github.request',
+          retries: 5,
+          timeoutMs: 30000,
+          backoff: {
+            type: 'exponential',
+            baseDelayMs: 5000,
+            maxDelayMs: 300000,  // Max 5 minutes
+            jitter: true
+          },
+          circuitBreaker: {
+            failureThreshold: 3,
+            resetTimeoutMs: 60000
+          },
+          retryOn: (error: any) => {
+            return error.status === 429 || error.message?.includes('HTTP 5');
+          },
+          useAbortSignal: true,
+          hooks: {
+            onRetry: ({ error }: any) => {
+              if (error.waitTime) {
+                console.log(`Rate limit hit. Waiting ${error.waitTime / 1000}s...`);
+              }
+            },
+            onCircuitOpen: () => {
+              console.error('🚨 GitHub API circuit opened - too many failures');
+            }
+          }
+        }
+      );
+      
+      async getUser(username: string) {
+        return this.request(`/users/${username}`);
+      }
+      
+      async getRepos(username: string) {
+        return this.request(`/users/${username}/repos`);
+      }
+    }
+
+    // Usage
+    const github = new GitHubClient(process.env.GITHUB_TOKEN!);
+
+    // Fetch multiple users - automatically rate limited
+    const users = ['octocat', 'torvalds', 'gaearon'];
+    const profiles = await Promise.all(
+      users.map(user => github.getUser(user))
+    );
+
+    console.log('Fetched profiles:', profiles.length);
+    ```
+  </Tab>
+  
+  <Tab title="Custom API with Metrics">
+    Track rate limit metrics and adjust dynamically:
+
+    ```typescript
+    import { withResilience, resilientFetch } from '@oldwhisper/resilience';
+
+    interface RateLimitMetrics {
+      totalRequests: number;
+      rateLimitHits: number;
+      avgWaitTime: number;
+      currentTokens: number;
+    }
+
+    class RateLimitedClient {
+      private rateLimiter: TokenBucket;
+      private metrics: RateLimitMetrics = {
+        totalRequests: 0,
+        rateLimitHits: 0,
+        avgWaitTime: 0,
+        currentTokens: 0
+      };
+      
+      constructor(
+        private baseUrl: string,
+        requestsPerSecond: number = 10
+      ) {
+        this.rateLimiter = new TokenBucket(
+          requestsPerSecond * 2,  // Burst capacity
+          requestsPerSecond
+        );
+      }
+      
+      request = withResilience(
+        async (endpoint: string) => {
+          this.metrics.totalRequests++;
+          
+          // Track wait time
+          const waitStart = Date.now();
+          await this.rateLimiter.consume();
+          const waitTime = Date.now() - waitStart;
+          
+          // Update average wait time
+          const total = this.metrics.avgWaitTime * (this.metrics.totalRequests - 1);
+          this.metrics.avgWaitTime = (total + waitTime) / this.metrics.totalRequests;
+          
+          const response = await resilientFetch(`${this.baseUrl}${endpoint}`);
+          
+          if (response.status === 429) {
+            this.metrics.rateLimitHits++;
+            throw new Error('Rate limit exceeded');
+          }
+          
+          if (!response.ok) {
+            throw new Error(`HTTP ${response.status}`);
+          }
+          
+          return response.json();
+        },
+        {
+          name: 'api.request',
+          retries: 5,
+          timeoutMs: 30000,
+          backoff: {
+            type: 'exponential',
+            baseDelayMs: 2000,
+            maxDelayMs: 60000,
+            jitter: true
+          },
+          circuitBreaker: {
+            failureThreshold: 5,
+            resetTimeoutMs: 120000
+          },
+          retryOn: (error) => error.message?.includes('Rate limit'),
+          useAbortSignal: true,
+          hooks: {
+            onFailure: ({ error }) => {
+              if (error.message?.includes('Rate limit')) {
+                console.warn('⚠️ Hit rate limit despite client-side throttling');
+              }
+            }
+          }
+        }
+      );
+      
+      getMetrics(): RateLimitMetrics {
+        return {
+          ...this.metrics,
+          currentTokens: this.rateLimiter.getTokens()
+        };
+      }
+    }
+
+    // Usage
+    const client = new RateLimitedClient('https://api.example.com', 5);
+
+    // Make many requests
+    const requests = Array.from({ length: 50 }, (_, i) => 
+      client.request(`/items/${i}`)
+    );
+
+    await Promise.all(requests);
+
+    // Check metrics
+    const metrics = client.getMetrics();
+    console.log('Rate Limit Metrics:', {
+      totalRequests: metrics.totalRequests,
+      rateLimitHits: metrics.rateLimitHits,
+      hitRate: (metrics.rateLimitHits / metrics.totalRequests * 100).toFixed(2) + '%',
+      avgWaitTime: metrics.avgWaitTime.toFixed(2) + 'ms',
+      currentTokens: metrics.currentTokens.toFixed(2)
+    });
+    ```
+  </Tab>
+</Tabs>
+
+## Adaptive Rate Limiting
+
+Adjust rate limits dynamically based on server responses:
+
+```typescript
+import { withResilience, resilientFetch } from '@oldwhisper/resilience';
+
+class AdaptiveRateLimiter {
+  private rateLimiter: TokenBucket;
+  private baseRate: number;
+  
+  constructor(initialRate: number) {
+    this.baseRate = initialRate;
+    this.rateLimiter = new TokenBucket(initialRate * 2, initialRate);
+  }
+  
+  /**
+   * Decrease rate limit after hitting rate limit
+   */
+  decreaseRate() {
+    this.baseRate = Math.max(1, this.baseRate * 0.5);
+    this.rateLimiter = new TokenBucket(
+      this.baseRate * 2,
+      this.baseRate
+    );
+    console.log(`⬇️ Decreased rate to ${this.baseRate.toFixed(2)} req/s`);
+  }
+  
+  /**
+   * Gradually increase rate limit after successful requests
+   */
+  increaseRate() {
+    const maxRate = 100;  // Don't exceed reasonable limit
+    this.baseRate = Math.min(maxRate, this.baseRate * 1.1);
+    this.rateLimiter = new TokenBucket(
+      this.baseRate * 2,
+      this.baseRate
+    );
+  }
+  
+  async consume() {
+    await this.rateLimiter.consume();
+  }
+  
+  getRate(): number {
+    return this.baseRate;
+  }
+}
+
+const adaptiveLimiter = new AdaptiveRateLimiter(10);
+let successfulRequests = 0;
+
+const adaptiveFetch = withResilience(
+  async (url: string) => {
+    await adaptiveLimiter.consume();
+    
+    const response = await resilientFetch(url);
+    
+    if (response.status === 429) {
+      // Decrease rate when we hit limit
+      adaptiveLimiter.decreaseRate();
+      throw new Error('Rate limit exceeded');
+    }
+    
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}`);
+    }
+    
+    // Increase rate gradually after successful requests
+    successfulRequests++;
+    if (successfulRequests % 100 === 0) {
+      adaptiveLimiter.increaseRate();
+      console.log(`⬆️ Current rate: ${adaptiveLimiter.getRate().toFixed(2)} req/s`);
+    }
+    
+    return response.json();
+  },
+  {
+    name: 'adaptiveFetch',
+    retries: 5,
+    timeoutMs: 30000,
+    backoff: {
+      type: 'exponential',
+      baseDelayMs: 2000,
+      maxDelayMs: 60000,
+      jitter: true
+    },
+    retryOn: (error) => error.message?.includes('Rate limit'),
+    useAbortSignal: true
+  }
+);
+
+// Usage - rate automatically adjusts
+for (let i = 0; i < 1000; i++) {
+  try {
+    await adaptiveFetch(`https://api.example.com/items/${i}`);
+  } catch (error) {
+    console.error(`Request ${i} failed:`, error.message);
+  }
+}
+```
+
+<Tip>
+  Adaptive rate limiting is ideal for APIs that don't publish their rate limits or when limits vary based on your plan or usage patterns.
+</Tip>
+
+## Batch Processing with Rate Limits
+
+Process large batches while respecting rate limits:
+
+```typescript
+import { withResilience, resilientFetch } from '@oldwhisper/resilience';
+
+class BatchProcessor {
+  private rateLimiter: TokenBucket;
+  
+  constructor(
+    private requestsPerSecond: number,
+    private concurrency: number = 5
+  ) {
+    this.rateLimiter = new TokenBucket(
+      requestsPerSecond * 2,
+      requestsPerSecond
+    );
+  }
+  
+  /**
+   * Process items in batches with rate limiting
+   */
+  async processBatch<T, R>(
+    items: T[],
+    processor: (item: T) => Promise<R>
+  ): Promise<R[]> {
+    const results: R[] = [];
+    const errors: Error[] = [];
+    
+    // Process with concurrency limit
+    const chunks = this.chunkArray(items, this.concurrency);
+    
+    for (const chunk of chunks) {
+      const chunkResults = await Promise.allSettled(
+        chunk.map(item => this.processItem(item, processor))
+      );
+      
+      for (const result of chunkResults) {
+        if (result.status === 'fulfilled') {
+          results.push(result.value);
+        } else {
+          errors.push(result.reason);
+        }
+      }
+    }
+    
+    if (errors.length > 0) {
+      console.warn(`Processed ${results.length}/${items.length} items. ${errors.length} failed.`);
+    }
+    
+    return results;
+  }
+  
+  private processItem = withResilience(
+    async <T, R>(item: T, processor: (item: T) => Promise<R>): Promise<R> => {
+      await this.rateLimiter.consume();
+      return await processor(item);
+    },
+    {
+      name: 'batchProcessor.processItem',
+      retries: 3,
+      timeoutMs: 30000,
+      backoff: {
+        type: 'exponential',
+        baseDelayMs: 1000,
+        maxDelayMs: 10000,
+        jitter: true
+      },
+      retryOn: (error: any) => {
+        return error.status === 429 || error.message?.includes('HTTP 5');
+      },
+      useAbortSignal: true
+    }
+  );
+  
+  private chunkArray<T>(array: T[], size: number): T[][] {
+    const chunks: T[][] = [];
+    for (let i = 0; i < array.length; i += size) {
+      chunks.push(array.slice(i, i + size));
+    }
+    return chunks;
+  }
+}
+
+// Usage
+const processor = new BatchProcessor(5, 3);  // 5 req/s, 3 concurrent
+
+const userIds = Array.from({ length: 100 }, (_, i) => `user-${i}`);
+
+const users = await processor.processBatch(
+  userIds,
+  async (userId) => {
+    const response = await resilientFetch(`https://api.example.com/users/${userId}`);
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    return response.json();
+  }
+);
+
+console.log(`Successfully processed ${users.length} users`);
+```
+
+## Best Practices
+
+- **Always implement client-side rate limiting** before relying on server-side limits
+- **Use token bucket algorithm** for smooth rate limiting with burst capacity
+- **Respect `Retry-After` headers** when provided by the API
+- **Combine rate limiting with circuit breakers** to handle API outages gracefully
+- **Use exponential backoff with jitter** when you hit rate limits
+- **Monitor rate limit metrics** to optimize your limits and detect issues
+- **Implement adaptive rate limiting** for APIs with undocumented or variable limits
+- **Batch process with concurrency limits** to avoid overwhelming APIs
+- **Set conservative initial limits** and increase gradually based on success rates
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="HTTP Retries" icon="globe" href="/examples/http-retries">
+    Learn more about HTTP retry strategies
+  </Card>
+  
+  <Card title="Circuit Breakers" icon="shield-halved" href="/concepts/circuit-breaker">
+    Deep dive into circuit breaker patterns
+  </Card>
+</CardGroup>

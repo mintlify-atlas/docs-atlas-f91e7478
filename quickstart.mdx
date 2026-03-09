@@ -1,80 +1,178 @@
 ---
-title: "Quickstart"
-description: "Start building awesome documentation in minutes"
+title: Quickstart
+description: Get started with Resilience in under 5 minutes
 ---
 
-## Get started in three steps
+This guide will walk you through installing Resilience and creating your first resilient function.
 
-Get your documentation site running locally and make your first customization.
+<Steps>
+  <Step title="Install the package">
+    Install Resilience using your preferred package manager:
 
-### Step 1: Set up your local environment
+    <CodeGroup>
+      ```bash npm
+      npm install @oldwhisper/resilience
+      ```
 
-<AccordionGroup>
-  <Accordion icon="copy" title="Clone your docs locally">
-    During the onboarding process, you created a GitHub repository with your docs content if you didn't already have one. You can find a link to this repository in your [dashboard](https://dashboard.mintlify.com).
-    
-    To clone the repository locally so that you can make and preview changes to your docs, follow the [Cloning a repository](https://docs.github.com/en/repositories/creating-and-managing-repositories/cloning-a-repository) guide in the GitHub docs.
-  </Accordion>
-  <Accordion icon="rectangle-terminal" title="Start the preview server">
-    1. Install the Mintlify CLI: `npm i -g mint`
-    2. Navigate to your docs directory and run: `mint dev`
-    3. Open `http://localhost:3000` to see your docs live!
-    
-    <Tip>Your preview updates automatically as you edit files.</Tip>
-  </Accordion>
-</AccordionGroup>
+      ```bash yarn
+      yarn add @oldwhisper/resilience
+      ```
 
-### Step 2: Deploy your changes
+      ```bash pnpm
+      pnpm add @oldwhisper/resilience
+      ```
+    </CodeGroup>
+  </Step>
 
-<AccordionGroup>
-  <Accordion icon="github" title="Install our GitHub app">
-    Install the Mintlify GitHub app from your [dashboard](https://dashboard.mintlify.com/settings/organization/github-app).
-    
-    Our GitHub app automatically deploys your changes to your docs site, so you don't need to manage deployments yourself.
-</Accordion>
-<Accordion icon="palette" title="Update your site name and colors">
-    For a first change, let's update the name and colors of your docs site.
+  <Step title="Wrap a function with resilience">
+    Import `withResilience` and wrap any function to add retry logic, timeouts, and more:
 
-    1. Open `docs.json` in your editor.
-    2. Change the `"name"` field to your project name.
-    3. Update the `"colors"` to match your brand.
-    4. Save and see your changes instantly at `http://localhost:3000`.
+    ```typescript
+    import { withResilience } from '@oldwhisper/resilience';
 
-    <Tip>Try changing the primary color to see an immediate difference!</Tip>
-  </Accordion>
-</AccordionGroup>
+    // Your original function
+    async function fetchData(url: string) {
+      const response = await fetch(url);
+      if (!response.ok) throw new Error('Request failed');
+      return response.json();
+    }
 
-### Step 3: Go live
+    // Wrap it with resilience features
+    const resilientFetch = withResilience(fetchData, {
+      name: 'fetchData',
+      retries: 3,
+      timeoutMs: 5000,
+      backoff: { type: 'exponential', baseDelayMs: 100, maxDelayMs: 2000 },
+      hooks: {
+        onAttempt: ({ name, attempt }) => 
+          console.log(`${name}: attempt ${attempt}`),
+        onRetry: ({ attempt, delayMs, error }) => 
+          console.log(`Retrying after ${delayMs}ms:`, error)
+      }
+    });
+    ```
 
-<Accordion icon="rocket" title="Publish your docs">
-  1. Commit and push your changes.
-  2. Your docs will update and be live in moments!
-</Accordion>
+    <Note>
+      `withResilience` always returns an async function, even if your original function is synchronous.
+    </Note>
+  </Step>
+
+  <Step title="Call your resilient function">
+    Use the wrapped function just like the original:
+
+    ```typescript
+    try {
+      const data = await resilientFetch('https://api.example.com/data');
+      console.log('Success:', data);
+    } catch (error) {
+      console.error('Failed after all retries:', error);
+    }
+    ```
+
+    The function will automatically:
+    - Retry up to 3 times on failure
+    - Wait with exponential backoff between retries
+    - Timeout after 5 seconds
+    - Log attempt and retry information
+  </Step>
+
+  <Step title="Track metrics with WrapperInit">
+    Use the `WrapperInit` class to track function calls and collect metrics:
+
+    ```typescript
+    import { WrapperInit } from '@oldwhisper/resilience';
+
+    function processOrder(orderId: number, amount: number) {
+      return orderId + amount;
+    }
+
+    const metrics = new WrapperInit();
+    const resilientProcess = metrics.wrap(processOrder, {
+      retries: 2,
+      timeoutMs: 1000
+    });
+
+    await resilientProcess(100, 250);
+    await resilientProcess(101, 300);
+
+    // Check metrics
+    console.log('Total calls:', metrics.functionCalls);
+    console.log('Per-function:', metrics.f_store);
+    ```
+
+    <Tip>
+      The `WrapperInit` class automatically tracks function attempts through its built-in hooks, giving you instant observability.
+    </Tip>
+  </Step>
+</Steps>
+
+## What's happening under the hood?
+
+When you wrap a function with `withResilience`:
+
+1. **First attempt**: The function executes normally
+2. **On failure**: If the function throws an error and retries are configured, Resilience catches it
+3. **Backoff delay**: Waits for the calculated delay (fixed or exponential)
+4. **Retry**: Attempts the function again
+5. **Hooks**: Triggers lifecycle hooks at each stage for observability
+6. **Circuit breaker**: If configured, opens after threshold failures to prevent cascading issues
+
+## Common configurations
+
+### Simple retry with fixed delay
+
+```typescript
+const fn = withResilience(myFunction, {
+  retries: 3,
+  backoff: { type: 'fixed', delayMs: 1000 }
+});
+```
+
+### Exponential backoff with jitter
+
+```typescript
+const fn = withResilience(myFunction, {
+  retries: 5,
+  backoff: { 
+    type: 'exponential', 
+    baseDelayMs: 100, 
+    maxDelayMs: 5000,
+    jitter: true 
+  }
+});
+```
+
+### Circuit breaker for protecting downstream services
+
+```typescript
+const fn = withResilience(myFunction, {
+  retries: 3,
+  circuitBreaker: {
+    failureThreshold: 5,
+    resetTimeoutMs: 60000
+  },
+  hooks: {
+    onCircuitOpen: ({ name }) => 
+      console.log(`Circuit breaker opened for ${name}`),
+    onCircuitClosed: ({ name }) => 
+      console.log(`Circuit breaker closed for ${name}`)
+  }
+});
+```
 
 ## Next steps
 
-Now that you have your docs running, explore these key features:
-
 <CardGroup cols={2}>
-
-<Card title="Write Content" icon="pen-to-square" href="/essentials/markdown">
-  Learn MDX syntax and start writing your documentation.
-</Card>
-
-<Card title="Customize style" icon="palette" href="/essentials/settings">
-  Make your docs match your brand perfectly.
-</Card>
-
-<Card title="Add code examples" icon="square-code" href="/essentials/code">
-  Include syntax-highlighted code blocks.
-</Card>
-
-<Card title="API documentation" icon="code" href="/api-reference/introduction">
-  Auto-generate API docs from OpenAPI specs.
-</Card>
-
+  <Card title="Installation" icon="download" href="/installation">
+    Detailed installation and setup instructions
+  </Card>
+  <Card title="Core concepts" icon="book" href="/concepts/retries">
+    Learn about retries, backoff strategies, and circuit breakers
+  </Card>
+  <Card title="Configuration" icon="gear" href="/api/configuration">
+    Complete configuration reference
+  </Card>
+  <Card title="API reference" icon="code" href="/api/with-resilience">
+    Full API documentation
+  </Card>
 </CardGroup>
-
-<Note>
-  **Need help?** See our [full documentation](https://mintlify.com/docs) or join our [community](https://mintlify.com/community).
-</Note>

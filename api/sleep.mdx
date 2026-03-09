@@ -1,0 +1,250 @@
+---
+title: 'sleep'
+description: 'Cancellable sleep utility that integrates with abort signals'
+---
+
+## Overview
+
+The `sleep` function provides a Promise-based delay that can be automatically cancelled when used within a resilient function with timeout or abort signal support.
+
+## Function Signature
+
+```typescript
+function sleep(
+  ms: number,
+  signal?: AbortSignal
+): Promise<void>
+```
+
+## Parameters
+
+<ParamField path="ms" type="number" required>
+  Duration to sleep in milliseconds.
+</ParamField>
+
+<ParamField path="signal" type="AbortSignal | undefined" default="activeSignal">
+  Optional abort signal to enable cancellation. If not provided, automatically uses the active signal from the current resilient execution context (if any).
+  
+  When the signal is aborted, the sleep promise rejects with an `Error('Aborted')`.
+</ParamField>
+
+## Return Value
+
+<ResponseField name="promise" type="Promise<void>">
+  A promise that resolves after the specified duration, or rejects if the abort signal is triggered.
+</ResponseField>
+
+## Implementation Details
+
+From `src/index.ts:173-192`, the function:
+
+1. Creates a timeout using `setTimeout`
+2. If an abort signal is provided or available from context:
+   - Checks if signal is already aborted and rejects immediately
+   - Listens for abort events and clears the timeout
+   - Rejects the promise with an "Aborted" error when cancelled
+3. If no signal is available, behaves like a simple delay
+
+```typescript
+export const sleep = (ms: number, signal: AbortSignal | undefined = activeSignal) =>
+  new Promise<void>((resolve, reject) => {
+    const id = setTimeout(resolve, ms);
+    if (!signal) return;
+
+    if (signal.aborted) {
+      clearTimeout(id);
+      reject(new Error('Aborted'));
+      return;
+    }
+
+    signal.addEventListener(
+      'abort',
+      () => {
+        clearTimeout(id);
+        reject(new Error('Aborted'));
+      },
+      { once: true }
+    );
+  });
+```
+
+## Examples
+
+### Basic Usage
+
+```typescript
+import { sleep } from '@your-org/resilience';
+
+// Simple delay
+await sleep(1000); // Wait 1 second
+console.log('Done waiting');
+```
+
+### With Manual Abort Signal
+
+```typescript
+const controller = new AbortController();
+
+// Start a sleep that can be cancelled
+const sleepPromise = sleep(5000, controller.signal);
+
+// Cancel after 2 seconds
+setTimeout(() => controller.abort(), 2000);
+
+try {
+  await sleepPromise;
+  console.log('Sleep completed');
+} catch (error) {
+  console.log('Sleep was cancelled:', error.message); // "Aborted"
+}
+```
+
+### Automatic Cancellation in Resilient Functions
+
+When used inside a function wrapped with `withResilience` and `useAbortSignal: true`, sleep automatically inherits the abort signal:
+
+```typescript
+import { withResilience, sleep } from '@your-org/resilience';
+
+const processWithDelay = withResilience(
+  async (data: any[]) => {
+    console.log('Starting processing...');
+    
+    // This sleep will be automatically cancelled if the function times out
+    await sleep(2000); // No need to pass signal explicitly!
+    
+    console.log('Processing after delay...');
+    return data.map(item => transform(item));
+  },
+  {
+    timeoutMs: 3000,
+    useAbortSignal: true // Enable automatic abort signal
+  }
+);
+
+// If processing takes longer than 3s, sleep is automatically cancelled
+try {
+  await processWithDelay(largeDataset);
+} catch (error) {
+  console.log('Timed out:', error.message); // "TimeoutError"
+}
+```
+
+### Polling with Cancellable Sleep
+
+```typescript
+const pollUntilReady = withResilience(
+  async (resourceId: string) => {
+    while (true) {
+      const status = await checkStatus(resourceId);
+      
+      if (status === 'ready') {
+        return status;
+      }
+      
+      // Sleep between polls, will be cancelled on timeout
+      await sleep(1000);
+    }
+  },
+  {
+    timeoutMs: 30000, // 30 second timeout
+    useAbortSignal: true
+  }
+);
+```
+
+### Multi-step Process with Sleep
+
+```typescript
+const multiStepProcess = withResilience(
+  async () => {
+    console.log('Step 1: Initialize');
+    await sleep(500);
+    
+    console.log('Step 2: Process');
+    await sleep(1000);
+    
+    console.log('Step 3: Finalize');
+    await sleep(500);
+    
+    return 'Complete';
+  },
+  {
+    retries: 2,
+    timeoutMs: 5000,
+    useAbortSignal: true
+  }
+);
+
+// All sleep calls will be cancelled if any step times out
+try {
+  await multiStepProcess();
+} catch (error) {
+  // Handle timeout or other errors
+}
+```
+
+### Rate Limiting with Sleep
+
+```typescript
+const rateLimitedFetch = withResilience(
+  async (urls: string[]) => {
+    const results = [];
+    
+    for (const url of urls) {
+      const response = await fetch(url);
+      results.push(await response.json());
+      
+      // Wait between requests, respects timeout
+      await sleep(100);
+    }
+    
+    return results;
+  },
+  {
+    timeoutMs: 10000,
+    useAbortSignal: true
+  }
+);
+```
+
+## Error Handling
+
+```typescript
+try {
+  await sleep(5000, signal);
+  console.log('Sleep completed normally');
+} catch (error) {
+  if (error.message === 'Aborted') {
+    console.log('Sleep was cancelled');
+  } else {
+    console.log('Unexpected error:', error);
+  }
+}
+```
+
+## Integration with Active Signal Context
+
+The `sleep` function automatically uses the active signal from the current execution context when `useAbortSignal` is enabled in `withResilience`:
+
+1. When `withResilience` creates an AbortController, it sets the active signal
+2. `sleep` (and `resilientFetch`) automatically use this signal
+3. When the timeout expires, the controller aborts, cancelling all pending operations
+4. The active signal is restored after execution completes
+
+This means you don't need to manually pass abort signals through your call chain - they're automatically propagated to all resilient utilities.
+
+## Use Cases
+
+- **Polling**: Wait between status checks with automatic timeout
+- **Rate Limiting**: Add delays between API calls
+- **Retry Delays**: Custom backoff logic using sleep
+- **Multi-step Workflows**: Add pauses between processing steps
+- **Testing**: Simulate delays in test scenarios
+- **Debouncing**: Implement debounce logic with cancellable delays
+
+## Related
+
+- [resilientFetch](/api/resilient-fetch) - Fetch wrapper with abort signal support
+- [withResilience](/api/with-resilience) - Core wrapping function
+- [Configuration](/api/configuration) - See `useAbortSignal` option

@@ -1,0 +1,411 @@
+---
+title: 'Error Handling'
+description: 'Advanced error handling strategies with retry filters and circuit breakers'
+icon: 'shield-halved'
+---
+
+## Overview
+
+Resilience provides sophisticated error handling capabilities, including selective retries, circuit breakers, and custom error filtering. This guide covers best practices for handling failures.
+
+## Selective Retries with retryOn
+
+Not all errors should trigger a retry. Use the `retryOn` option to filter which errors are retryable:
+
+### Basic Error Filtering
+
+```typescript
+import { withResilience } from '@oldwhisper/resilience';
+
+async function fetchData(url: string) {
+  const response = await fetch(url);
+  if (!response.ok) {
+    throw new Error(`HTTP ${response.status}`);
+  }
+  return response.json();
+}
+
+const resilientFetch = withResilience(fetchData, {
+  name: 'fetchData',
+  retries: 3,
+  retryOn: (error) => {
+    // Only retry on network errors or 5xx server errors
+    if (error instanceof Error) {
+      const message = error.message;
+      return message.includes('network') || 
+             message.includes('HTTP 5');
+    }
+    return false;
+  }
+});
+```
+
+<Note>
+  By default, `retryOn` returns `true` for all errors. Providing a custom function gives you fine-grained control over retry behavior.
+</Note>
+
+### Retry on Specific HTTP Status Codes
+
+```typescript
+class HTTPError extends Error {
+  constructor(public status: number, message: string) {
+    super(message);
+    this.name = 'HTTPError';
+  }
+}
+
+async function apiCall(endpoint: string) {
+  const response = await fetch(endpoint);
+  if (!response.ok) {
+    throw new HTTPError(response.status, `Request failed: ${response.status}`);
+  }
+  return response.json();
+}
+
+const resilientAPI = withResilience(apiCall, {
+  name: 'apiCall',
+  retries: 3,
+  retryOn: (error) => {
+    // Retry on 429 (rate limit), 503 (service unavailable), 504 (gateway timeout)
+    if (error instanceof HTTPError) {
+      return [429, 503, 504].includes(error.status);
+    }
+    // Also retry on network errors
+    return error instanceof TypeError;
+  },
+  backoff: {
+    type: 'exponential',
+    baseDelayMs: 1000,
+    maxDelayMs: 10000,
+    jitter: true
+  }
+});
+```
+
+<Tip>
+  Don't retry client errors (4xx) except for 429 (rate limit). These typically indicate invalid requests that won't succeed on retry.
+</Tip>
+
+### Retry Based on Error Properties
+
+```typescript
+interface ServiceError {
+  code: string;
+  retryable: boolean;
+  message: string;
+}
+
+const resilientService = withResilience(callService, {
+  name: 'service',
+  retries: 3,
+  retryOn: (error) => {
+    // Check if error has retryable property
+    if (typeof error === 'object' && error !== null) {
+      const serviceError = error as ServiceError;
+      return serviceError.retryable === true;
+    }
+    return false;
+  }
+});
+```
+
+## Circuit Breaker Pattern
+
+Circuit breakers prevent cascading failures by stopping requests to unhealthy services:
+
+### Basic Circuit Breaker
+
+```typescript
+import { withResilience } from '@oldwhisper/resilience';
+
+const resilientExternal = withResilience(callExternalService, {
+  name: 'externalService',
+  retries: 2,
+  circuitBreaker: {
+    failureThreshold: 5,     // Open after 5 failures
+    resetTimeoutMs: 30000    // Try again after 30 seconds
+  }
+});
+
+try {
+  const result = await resilientExternal();
+  console.log('Success:', result);
+} catch (error) {
+  if (error instanceof Error && error.message.includes('CircuitOpenError')) {
+    console.error('Circuit breaker is open - service is unavailable');
+  } else {
+    console.error('Request failed:', error);
+  }
+}
+```
+
+### Circuit Breaker States
+
+The circuit breaker has three states:
+
+<Steps>
+  <Step title="CLOSED (Normal)">
+    All requests pass through normally. Failures are counted.
+
+    ```typescript
+    // Circuit is CLOSED - requests flow normally
+    await resilientFunction(); // ✓ Executes
+    ```
+  </Step>
+
+  <Step title="OPEN (Blocking)">
+    After reaching the failure threshold, the circuit opens and all requests are immediately rejected with `CircuitOpenError`.
+
+    ```typescript
+    // After 5 failures, circuit opens
+    await resilientFunction(); // ✗ Throws CircuitOpenError immediately
+    ```
+  </Step>
+
+  <Step title="HALF_OPEN (Testing)">
+    After the reset timeout, the circuit enters HALF_OPEN state and allows one test request. If successful, the circuit closes. If failed, it reopens.
+
+    ```typescript
+    // After 30 seconds, circuit enters HALF_OPEN
+    await resilientFunction(); // Test request
+    // If successful → circuit CLOSES
+    // If failed → circuit OPENS again
+    ```
+  </Step>
+</Steps>
+
+### Circuit Breaker with Monitoring
+
+```typescript
+import { withResilience } from '@oldwhisper/resilience';
+
+const circuitStats = {
+  state: 'CLOSED',
+  failures: 0,
+  lastOpened: null as Date | null,
+  lastClosed: null as Date | null
+};
+
+const resilientDB = withResilience(queryDatabase, {
+  name: 'database',
+  retries: 1,
+  timeoutMs: 5000,
+  circuitBreaker: {
+    failureThreshold: 10,
+    resetTimeoutMs: 60000 // 1 minute
+  },
+  hooks: {
+    onCircuitOpen: ({ name }) => {
+      circuitStats.state = 'OPEN';
+      circuitStats.lastOpened = new Date();
+      console.error(`[${name}] Circuit opened - database appears unhealthy`);
+      
+      // Send alert
+      alerting.critical('Database circuit breaker opened');
+    },
+    
+    onCircuitHalfOpen: ({ name }) => {
+      circuitStats.state = 'HALF_OPEN';
+      console.warn(`[${name}] Testing database connection...`);
+    },
+    
+    onCircuitClosed: ({ name }) => {
+      circuitStats.state = 'CLOSED';
+      circuitStats.lastClosed = new Date();
+      circuitStats.failures = 0;
+      console.log(`[${name}] Circuit closed - database recovered`);
+      
+      alerting.resolve('Database circuit breaker closed');
+    },
+    
+    onFailure: ({ name }) => {
+      circuitStats.failures++;
+    }
+  }
+});
+```
+
+## Combining Retry Logic and Circuit Breakers
+
+Use both together for maximum resilience:
+
+```typescript
+import { withResilience } from '@oldwhisper/resilience';
+
+class APIError extends Error {
+  constructor(public statusCode: number, message: string) {
+    super(message);
+    this.name = 'APIError';
+  }
+}
+
+async function callPaymentAPI(orderId: string) {
+  const response = await fetch(`/api/payments/${orderId}`);
+  if (!response.ok) {
+    throw new APIError(response.status, `Payment API failed`);
+  }
+  return response.json();
+}
+
+const resilientPayment = withResilience(callPaymentAPI, {
+  name: 'paymentAPI',
+  
+  // Retry configuration
+  retries: 3,
+  retryOn: (error) => {
+    // Only retry transient errors
+    if (error instanceof APIError) {
+      // Retry on rate limits and server errors
+      return error.statusCode === 429 || error.statusCode >= 500;
+    }
+    return true; // Retry network errors
+  },
+  
+  // Backoff strategy
+  backoff: {
+    type: 'exponential',
+    baseDelayMs: 500,
+    maxDelayMs: 5000,
+    jitter: true
+  },
+  
+  // Circuit breaker
+  circuitBreaker: {
+    failureThreshold: 5,
+    resetTimeoutMs: 30000
+  },
+  
+  // Timeout
+  timeoutMs: 10000,
+  
+  // Monitoring
+  hooks: {
+    onRetry: ({ attempt, delayMs, error }) => {
+      console.log(`Retrying payment API (attempt ${attempt}) after ${delayMs}ms`);
+    },
+    onCircuitOpen: () => {
+      console.error('Payment API circuit breaker opened!');
+    }
+  }
+});
+```
+
+## Error Handling Best Practices
+
+### 1. Don't Retry Everything
+
+```typescript
+// ✗ Bad - retries everything including client errors
+const bad = withResilience(apiCall, {
+  retries: 3
+});
+
+// ✓ Good - only retries transient failures
+const good = withResilience(apiCall, {
+  retries: 3,
+  retryOn: (error) => {
+    if (error instanceof HTTPError) {
+      // Don't retry client errors (except rate limit)
+      return error.status >= 500 || error.status === 429;
+    }
+    return true;
+  }
+});
+```
+
+### 2. Use Appropriate Timeouts
+
+```typescript
+// Fast API - short timeout
+const fastAPI = withResilience(quickQuery, {
+  name: 'quickQuery',
+  timeoutMs: 1000,
+  retries: 2
+});
+
+// Slow batch job - longer timeout
+const batchJob = withResilience(processLargeBatch, {
+  name: 'batchJob',
+  timeoutMs: 300000, // 5 minutes
+  retries: 1
+});
+```
+
+### 3. Combine with Abort Signals
+
+```typescript
+const resilientAPI = withResilience(apiCall, {
+  name: 'api',
+  retries: 3,
+  timeoutMs: 5000,
+  useAbortSignal: true // Enable abort signal
+});
+```
+
+When `useAbortSignal` is enabled, the abort signal is automatically passed to compatible functions like `resilientFetch()` and `sleep()`.
+
+### 4. Handle Circuit Breaker Errors Gracefully
+
+```typescript
+try {
+  const data = await resilientService();
+  return data;
+} catch (error) {
+  if (error instanceof Error) {
+    if (error.message.includes('CircuitOpenError')) {
+      // Service is down, return cached data or default
+      return getCachedData();
+    }
+    if (error.message.includes('TimeoutError')) {
+      // Request timed out
+      throw new Error('Service is slow, please try again');
+    }
+  }
+  throw error;
+}
+```
+
+## Timeout Handling
+
+Timeouts prevent requests from hanging indefinitely:
+
+```typescript
+import { withResilience } from '@oldwhisper/resilience';
+
+const resilientSlowService = withResilience(slowService, {
+  name: 'slowService',
+  timeoutMs: 5000,
+  retries: 2,
+  hooks: {
+    onFailure: ({ error }) => {
+      if (error instanceof Error && error.message === 'TimeoutError') {
+        console.error('Request timed out after 5 seconds');
+      }
+    }
+  }
+});
+
+try {
+  await resilientSlowService();
+} catch (error) {
+  if (error instanceof Error && error.message === 'TimeoutError') {
+    // Handle timeout specifically
+    console.log('Service is taking too long, returning fallback');
+  }
+}
+```
+
+<Tip>
+  Set timeouts based on your service's p99 latency. For most APIs, 5-10 seconds is reasonable.
+</Tip>
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Advanced Patterns" icon="wand-magic-sparkles" href="/guides/advanced-patterns">
+    Learn complex patterns combining multiple resilience features
+  </Card>
+  <Card title="API Reference" icon="code" href="/api/with-resilience">
+    Complete API documentation
+  </Card>
+</CardGroup>

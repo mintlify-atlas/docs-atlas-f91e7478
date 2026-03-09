@@ -1,0 +1,330 @@
+---
+title: 'WrapperInit'
+description: 'Metrics adapter class with helpers for resilience hooks'
+---
+
+## Overview
+
+The `WrapperInit` class provides a convenient way to track function execution metrics while wrapping functions with resilience behavior. It maintains counters for function calls and provides built-in hooks integration.
+
+## Class Definition
+
+```typescript
+class WrapperInit {
+  functionCalls: number;
+  f_store: Map<string, number>;
+  
+  record(name: string): void;
+  hooks(): ResilienceHooks;
+  wrap<Fn extends (...args: any[]) => any>(
+    fn: Fn,
+    config?: Omit<ResilienceConfig, 'hooks' | 'name'> & { name?: string }
+  ): (...args: Parameters<Fn>) => Promise<Awaited<ReturnType<Fn>>>;
+  run<Fn extends (...args: any[]) => any>(
+    fn: Fn,
+    ...args: Parameters<Fn>
+  ): ReturnType<Fn>;
+}
+```
+
+## Constructor
+
+```typescript
+const wrapper = new WrapperInit();
+```
+
+Creates a new metrics tracker with initialized counters.
+
+## Properties
+
+<ResponseField name="functionCalls" type="number" default="0">
+  Total number of function calls tracked across all functions.
+</ResponseField>
+
+<ResponseField name="f_store" type="Map<string, number>" default="new Map()">
+  Map of function names to their individual call counts. Key is the function name, value is the number of times that function was attempted.
+</ResponseField>
+
+## Methods
+
+### record()
+
+Records a function attempt by name, incrementing both the function-specific counter and the total counter.
+
+```typescript
+record(name: string): void
+```
+
+<ParamField path="name" type="string" required>
+  The name of the function to record an attempt for.
+</ParamField>
+
+**Implementation** (from `src/index.ts:214-218`):
+
+```typescript
+record(name: string) {
+  const prev = this.f_store.get(name) ?? 0;
+  this.f_store.set(name, prev + 1);
+  this.functionCalls++;
+}
+```
+
+### hooks()
+
+Returns a `ResilienceHooks` object that automatically records metrics on each attempt.
+
+```typescript
+hooks(): ResilienceHooks
+```
+
+<ResponseField name="hooks" type="ResilienceHooks">
+  A hooks object with `onAttempt` configured to call `record(name)` for each function attempt.
+</ResponseField>
+
+**Implementation** (from `src/index.ts:223-229`):
+
+```typescript
+hooks(): Resilience.ResilienceHooks {
+  return {
+    onAttempt: ({ name }) => {
+      this.record(name);
+    },
+  };
+}
+```
+
+### wrap()
+
+Wraps a function with resilience behavior and automatically attaches metrics hooks.
+
+```typescript
+wrap<Fn extends (...args: any[]) => any>(
+  fn: Fn,
+  config?: Omit<ResilienceConfig, 'hooks' | 'name'> & { name?: string }
+): (...args: Parameters<Fn>) => Promise<Awaited<ReturnType<Fn>>>
+```
+
+<ParamField path="fn" type="Fn extends (...args: any[]) => any" required>
+  The function to wrap with resilience and metrics tracking.
+</ParamField>
+
+<ParamField path="config" type="Omit<ResilienceConfig, 'hooks' | 'name'> & { name?: string }" default="{}">
+  Resilience configuration without `hooks` or `name` (those are set automatically).
+  
+  <Expandable title="config properties">
+    <ResponseField name="name" type="string">
+      Optional function name. Defaults to `fn.name` or "anonymous".
+    </ResponseField>
+    
+    <ResponseField name="retries" type="number">
+      Number of retry attempts.
+    </ResponseField>
+    
+    <ResponseField name="timeoutMs" type="number">
+      Execution timeout in milliseconds.
+    </ResponseField>
+    
+    <ResponseField name="backoff" type="BackoffStrategy">
+      Backoff strategy for retries.
+    </ResponseField>
+    
+    <ResponseField name="retryOn" type="(err: unknown) => boolean">
+      Predicate to determine if error should trigger retry.
+    </ResponseField>
+    
+    <ResponseField name="circuitBreaker" type="CircuitBreakerConfig">
+      Circuit breaker configuration.
+    </ResponseField>
+    
+    <ResponseField name="useAbortSignal" type="boolean">
+      Enable abort signal support.
+    </ResponseField>
+  </Expandable>
+</ParamField>
+
+<ResponseField name="wrappedFunction" type="(...args: Parameters<Fn>) => Promise<Awaited<ReturnType<Fn>>>">
+  The wrapped function with resilience and metrics tracking.
+</ResponseField>
+
+**Implementation** (from `src/index.ts:234-243`):
+
+```typescript
+wrap<Fn extends (...args: any[]) => any>(
+  fn: Fn,
+  config: Omit<Resilience.ResilienceConfig, 'hooks' | 'name'> & { name?: string } = {}
+) {
+  return withResilience(fn, {
+    ...config,
+    name: config.name ?? fn.name ?? 'anonymous',
+    hooks: this.hooks(),
+  });
+}
+```
+
+### run()
+
+Runs a function immediately and records metrics without applying resilience features.
+
+```typescript
+run<Fn extends (...args: any[]) => any>(
+  fn: Fn,
+  ...args: Parameters<Fn>
+): ReturnType<Fn>
+```
+
+<ParamField path="fn" type="Fn extends (...args: any[]) => any" required>
+  The function to execute.
+</ParamField>
+
+<ParamField path="args" type="Parameters<Fn>" required>
+  Arguments to pass to the function.
+</ParamField>
+
+<ResponseField name="result" type="ReturnType<Fn>">
+  The return value from executing the function (not wrapped in a Promise).
+</ResponseField>
+
+**Implementation** (from `src/index.ts:248-258`):
+
+```typescript
+run<Fn extends (...args: any[]) => any>(fn: Fn, ...args: Parameters<Fn>): ReturnType<Fn> {
+  const wf = new WrappedFunction(fn, ...args)
+  if (!this.f_store.has(wf.name)) {
+    this.f_store.set(wf.name, 0)
+  }
+  const val = wf.run();
+  const cur_count: number = this.f_store.get(wf.name) as number;
+  this.f_store.set(wf.name, cur_count + 1);
+  this.functionCalls++;
+  return val.returnValue
+}
+```
+
+## Examples
+
+### Basic Usage with Metrics Tracking
+
+```typescript
+import { WrapperInit } from '@your-org/resilience';
+
+const wrapper = new WrapperInit();
+
+// Wrap multiple functions
+const fetchUser = wrapper.wrap(
+  async (id: string) => {
+    return await fetch(`/api/users/${id}`).then(r => r.json());
+  },
+  {
+    name: 'fetch-user',
+    retries: 3,
+    timeoutMs: 5000
+  }
+);
+
+const fetchPosts = wrapper.wrap(
+  async (userId: string) => {
+    return await fetch(`/api/posts?user=${userId}`).then(r => r.json());
+  },
+  {
+    name: 'fetch-posts',
+    retries: 2
+  }
+);
+
+// Use the wrapped functions
+await fetchUser('123');
+await fetchUser('456');
+await fetchPosts('123');
+
+// Check metrics
+console.log('Total calls:', wrapper.functionCalls); // 3
+console.log('fetch-user calls:', wrapper.f_store.get('fetch-user')); // 2
+console.log('fetch-posts calls:', wrapper.f_store.get('fetch-posts')); // 1
+```
+
+### Using run() for Synchronous Execution
+
+```typescript
+const wrapper = new WrapperInit();
+
+function calculateTotal(items: number[]): number {
+  return items.reduce((sum, item) => sum + item, 0);
+}
+
+// Run without resilience features, just tracking
+const result = wrapper.run(calculateTotal, [1, 2, 3, 4, 5]);
+console.log('Result:', result); // 15
+console.log('Total calls:', wrapper.functionCalls); // 1
+```
+
+### Tracking Metrics Across Application
+
+```typescript
+// Create a global wrapper instance
+export const metricsWrapper = new WrapperInit();
+
+// In different modules, wrap your functions
+export const apiClient = {
+  getUser: metricsWrapper.wrap(getUserImpl, {
+    name: 'api.getUser',
+    retries: 3,
+    circuitBreaker: {
+      failureThreshold: 5,
+      resetTimeoutMs: 60000
+    }
+  }),
+  
+  createOrder: metricsWrapper.wrap(createOrderImpl, {
+    name: 'api.createOrder',
+    retries: 2,
+    timeoutMs: 10000
+  })
+};
+
+// Expose metrics endpoint
+app.get('/metrics', (req, res) => {
+  res.json({
+    totalCalls: metricsWrapper.functionCalls,
+    perFunction: Object.fromEntries(metricsWrapper.f_store)
+  });
+});
+```
+
+### Custom Hooks with Wrapper
+
+If you need additional hooks beyond metrics tracking, use `withResilience` directly:
+
+```typescript
+const wrapper = new WrapperInit();
+
+const myFunction = withResilience(
+  async () => { /* ... */ },
+  {
+    name: 'my-function',
+    retries: 3,
+    hooks: {
+      ...wrapper.hooks(), // Include metrics tracking
+      onSuccess: ({ name, timeMs }) => {
+        logger.info(`${name} succeeded in ${timeMs}ms`);
+      },
+      onFailure: ({ name, error }) => {
+        logger.error(`${name} failed:`, error);
+      }
+    }
+  }
+);
+```
+
+## Use Cases
+
+- **API Client Libraries**: Track request counts per endpoint
+- **Background Jobs**: Monitor job execution frequency
+- **Microservices**: Collect service-to-service call metrics
+- **Testing**: Verify retry behavior by checking attempt counts
+- **Dashboards**: Export metrics for visualization
+
+## Related
+
+- [withResilience](/api/with-resilience) - Core function for wrapping with resilience
+- [Hooks](/api/hooks) - Full hooks API reference
+- [Configuration](/api/configuration) - Resilience configuration options

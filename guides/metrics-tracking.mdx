@@ -1,0 +1,370 @@
+---
+title: 'Metrics Tracking'
+description: 'Monitor and track resilient function execution with hooks and metrics'
+icon: 'chart-line'
+---
+
+## Overview
+
+Resilience provides powerful hooks to track function execution, failures, retries, and circuit breaker state changes. This guide shows you how to implement comprehensive monitoring.
+
+## Using WrapperInit
+
+The `WrapperInit` class is the simplest way to track basic metrics:
+
+```typescript
+import { WrapperInit } from '@oldwhisper/resilience';
+
+const metrics = new WrapperInit();
+
+async function fetchData(url: string) {
+  const response = await fetch(url);
+  return response.json();
+}
+
+const resilientFetch = metrics.wrap(fetchData, {
+  retries: 3,
+  timeoutMs: 5000
+});
+
+// Make some calls
+await resilientFetch('https://api.example.com/data');
+await resilientFetch('https://api.example.com/users');
+
+// Access metrics
+console.log('Total function calls:', metrics.functionCalls);
+console.log('Calls by function:', Object.fromEntries(metrics.f_store));
+```
+
+<Note>
+  `WrapperInit.wrap()` automatically names the function based on the original function name. You can override this with the `name` option.
+</Note>
+
+## Custom Hooks
+
+For advanced monitoring, implement custom hooks to track specific events:
+
+### Tracking All Events
+
+```typescript
+import { withResilience } from '@oldwhisper/resilience';
+
+const stats = {
+  attempts: 0,
+  successes: 0,
+  failures: 0,
+  retries: 0
+};
+
+const resilientFunction = withResilience(myFunction, {
+  name: 'myFunction',
+  retries: 3,
+  hooks: {
+    onAttempt: ({ name, attempt }) => {
+      stats.attempts++;
+      console.log(`[${name}] Attempt #${attempt}`);
+    },
+    
+    onSuccess: ({ name, attempt, timeMs }) => {
+      stats.successes++;
+      console.log(`[${name}] Success on attempt ${attempt} (${timeMs}ms)`);
+    },
+    
+    onFailure: ({ name, attempt, timeMs, error }) => {
+      stats.failures++;
+      console.error(`[${name}] Failed attempt ${attempt} (${timeMs}ms):`, error);
+    },
+    
+    onRetry: ({ name, attempt, delayMs, error }) => {
+      stats.retries++;
+      console.log(`[${name}] Retrying after ${delayMs}ms (attempt ${attempt})`);
+    }
+  }
+});
+```
+
+### Integration with Monitoring Services
+
+Integrate with observability platforms like Prometheus, DataDog, or New Relic:
+
+<Tabs>
+  <Tab title="Prometheus">
+    ```typescript
+    import { Counter, Histogram } from 'prom-client';
+    import { withResilience } from '@oldwhisper/resilience';
+
+    const attemptCounter = new Counter({
+      name: 'resilience_attempts_total',
+      help: 'Total number of function attempts',
+      labelNames: ['function', 'result']
+    });
+
+    const durationHistogram = new Histogram({
+      name: 'resilience_duration_ms',
+      help: 'Function execution duration in milliseconds',
+      labelNames: ['function']
+    });
+
+    const resilientAPI = withResilience(apiCall, {
+      name: 'apiCall',
+      retries: 3,
+      hooks: {
+        onSuccess: ({ name, timeMs }) => {
+          attemptCounter.inc({ function: name, result: 'success' });
+          durationHistogram.observe({ function: name }, timeMs);
+        },
+        
+        onFailure: ({ name, timeMs }) => {
+          attemptCounter.inc({ function: name, result: 'failure' });
+          durationHistogram.observe({ function: name }, timeMs);
+        }
+      }
+    });
+    ```
+  </Tab>
+
+  <Tab title="DataDog">
+    ```typescript
+    import { StatsD } from 'hot-shots';
+    import { withResilience } from '@oldwhisper/resilience';
+
+    const dogstatsd = new StatsD();
+
+    const resilientAPI = withResilience(apiCall, {
+      name: 'apiCall',
+      retries: 3,
+      hooks: {
+        onAttempt: ({ name }) => {
+          dogstatsd.increment(`resilience.${name}.attempts`);
+        },
+        
+        onSuccess: ({ name, timeMs }) => {
+          dogstatsd.increment(`resilience.${name}.success`);
+          dogstatsd.timing(`resilience.${name}.duration`, timeMs);
+        },
+        
+        onFailure: ({ name }) => {
+          dogstatsd.increment(`resilience.${name}.failure`);
+        },
+        
+        onRetry: ({ name, delayMs }) => {
+          dogstatsd.increment(`resilience.${name}.retries`);
+          dogstatsd.timing(`resilience.${name}.retry_delay`, delayMs);
+        }
+      }
+    });
+    ```
+  </Tab>
+
+  <Tab title="Custom Logger">
+    ```typescript
+    import { withResilience } from '@oldwhisper/resilience';
+    import logger from './logger';
+
+    const resilientAPI = withResilience(apiCall, {
+      name: 'apiCall',
+      retries: 3,
+      hooks: {
+        onAttempt: ({ name, attempt }) => {
+          logger.info('Function attempt', { name, attempt });
+        },
+        
+        onSuccess: ({ name, attempt, timeMs }) => {
+          logger.info('Function succeeded', {
+            name,
+            attempt,
+            duration_ms: timeMs
+          });
+        },
+        
+        onFailure: ({ name, attempt, timeMs, error }) => {
+          logger.error('Function failed', {
+            name,
+            attempt,
+            duration_ms: timeMs,
+            error: error instanceof Error ? error.message : String(error)
+          });
+        },
+        
+        onRetry: ({ name, attempt, delayMs, error }) => {
+          logger.warn('Retrying function', {
+            name,
+            attempt,
+            delay_ms: delayMs,
+            reason: error instanceof Error ? error.message : String(error)
+          });
+        }
+      }
+    });
+    ```
+  </Tab>
+</Tabs>
+
+## Circuit Breaker Monitoring
+
+Track circuit breaker state changes to understand service health:
+
+```typescript
+import { withResilience } from '@oldwhisper/resilience';
+
+const circuitState = {
+  current: 'CLOSED' as 'CLOSED' | 'OPEN' | 'HALF_OPEN',
+  openedAt: null as Date | null,
+  closedAt: null as Date | null
+};
+
+const resilientService = withResilience(externalServiceCall, {
+  name: 'externalService',
+  retries: 2,
+  circuitBreaker: {
+    failureThreshold: 5,
+    resetTimeoutMs: 30000 // 30 seconds
+  },
+  hooks: {
+    onCircuitOpen: ({ name }) => {
+      circuitState.current = 'OPEN';
+      circuitState.openedAt = new Date();
+      console.error(`[${name}] Circuit breaker opened!`);
+      // Alert your team
+      alerting.send(`Circuit breaker opened for ${name}`);
+    },
+    
+    onCircuitHalfOpen: ({ name }) => {
+      circuitState.current = 'HALF_OPEN';
+      console.warn(`[${name}] Circuit breaker half-open, testing service...`);
+    },
+    
+    onCircuitClosed: ({ name }) => {
+      circuitState.current = 'CLOSED';
+      circuitState.closedAt = new Date();
+      console.log(`[${name}] Circuit breaker closed, service recovered`);
+      alerting.send(`Circuit breaker closed for ${name}`);
+    }
+  }
+});
+```
+
+<Tip>
+  Monitor circuit breaker state changes in your observability platform to get alerts when services become unhealthy.
+</Tip>
+
+## Building a Metrics Dashboard
+
+Combine all hooks to build a comprehensive metrics system:
+
+```typescript
+import { withResilience } from '@oldwhisper/resilience';
+
+class ResilienceMetrics {
+  private metrics = new Map<string, {
+    attempts: number;
+    successes: number;
+    failures: number;
+    retries: number;
+    totalDuration: number;
+    avgDuration: number;
+  }>();
+
+  record(name: string) {
+    if (!this.metrics.has(name)) {
+      this.metrics.set(name, {
+        attempts: 0,
+        successes: 0,
+        failures: 0,
+        retries: 0,
+        totalDuration: 0,
+        avgDuration: 0
+      });
+    }
+  }
+
+  hooks() {
+    return {
+      onAttempt: ({ name }: { name: string }) => {
+        this.record(name);
+        this.metrics.get(name)!.attempts++;
+      },
+      
+      onSuccess: ({ name, timeMs }: { name: string; timeMs: number }) => {
+        const m = this.metrics.get(name)!;
+        m.successes++;
+        m.totalDuration += timeMs;
+        m.avgDuration = m.totalDuration / m.successes;
+      },
+      
+      onFailure: ({ name, timeMs }: { name: string; timeMs: number }) => {
+        const m = this.metrics.get(name)!;
+        m.failures++;
+        m.totalDuration += timeMs;
+      },
+      
+      onRetry: ({ name }: { name: string }) => {
+        this.metrics.get(name)!.retries++;
+      }
+    };
+  }
+
+  getStats(name: string) {
+    return this.metrics.get(name);
+  }
+
+  getAllStats() {
+    return Object.fromEntries(this.metrics);
+  }
+
+  getSuccessRate(name: string) {
+    const m = this.metrics.get(name);
+    if (!m || m.attempts === 0) return 0;
+    return (m.successes / m.attempts) * 100;
+  }
+}
+
+// Usage
+const metrics = new ResilienceMetrics();
+
+const apiCall = withResilience(fetchData, {
+  name: 'fetchData',
+  retries: 3,
+  hooks: metrics.hooks()
+});
+
+await apiCall();
+
+console.log('Stats:', metrics.getStats('fetchData'));
+console.log('Success rate:', metrics.getSuccessRate('fetchData') + '%');
+```
+
+## Recording Metrics Without Resilience
+
+Use `WrapperInit.run()` to track function calls without adding resilience features:
+
+```typescript
+import { WrapperInit } from '@oldwhisper/resilience';
+
+const metrics = new WrapperInit();
+
+function calculateSum(a: number, b: number) {
+  return a + b;
+}
+
+// Track but don't add resilience
+const result = metrics.run(calculateSum, 5, 3);
+
+console.log('Result:', result);
+console.log('Calls:', metrics.functionCalls);
+```
+
+<Note>
+  Unlike `wrap()`, the `run()` method executes synchronously and doesn't add resilience features.
+</Note>
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Error Handling" icon="shield-halved" href="/guides/error-handling">
+    Learn how to filter retries and handle specific error types
+  </Card>
+  <Card title="Advanced Patterns" icon="wand-magic-sparkles" href="/guides/advanced-patterns">
+    Combine features for complex real-world scenarios
+  </Card>
+</CardGroup>

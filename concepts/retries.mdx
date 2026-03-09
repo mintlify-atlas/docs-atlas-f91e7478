@@ -1,0 +1,233 @@
+---
+title: Retries
+description: Automatically retry failed operations with configurable retry logic
+---
+
+## What are Retries?
+
+Retries are a fundamental resilience pattern that automatically re-executes failed operations. When a function fails due to transient errors (like network glitches or temporary service unavailability), retries give it another chance to succeed before propagating the error to your application.
+
+## Why Use Retries?
+
+Transient failures are common in distributed systems:
+
+- **Network instability**: Temporary packet loss or connection issues
+- **Service overload**: Momentary capacity constraints that resolve quickly
+- **Rate limiting**: Brief throttling that clears after a short wait
+- **Resource contention**: Temporary locks or conflicts that resolve
+
+Retries help your application gracefully handle these temporary issues without manual intervention.
+
+<Warning>
+  Retries should only be used for **idempotent** operations that can be safely executed multiple times. Avoid retrying operations that modify state in non-idempotent ways (e.g., creating records without idempotency keys).
+</Warning>
+
+## How Retries Work in Resilience
+
+The `withResilience` wrapper manages the retry loop automatically. Here's how it works:
+
+1. Execute the wrapped function
+2. If it succeeds, return the result immediately
+3. If it fails, check if retries remain and the error is retryable
+4. If retrying, wait for the backoff delay (if configured)
+5. Attempt the function again
+6. Repeat until success or retry limit reached
+
+From `src/index.ts:129-163`:
+
+```typescript
+for (let attempt = 1; attempt <= retries + 1; attempt++) {
+    hooks?.onAttempt?.({ name, attempt });
+
+    if (breaker && !breaker.canAttempt()) {
+        const e = new Error(`CircuitOpenError: ${name}`);
+        lastErr = e;
+        throw e;
+    }
+
+    const start = Date.now();
+    try {
+        const controller = config.useAbortSignal ? new AbortController() : undefined;
+        const result = await runWithActiveSignal(controller?.signal, async () => {
+            const execPromise = Promise.resolve(fn(...args)) as Promise<Awaited<ReturnType<Fn>>>;
+            return await withTimeout(execPromise, config.timeoutMs, controller);
+        });
+        const timeMs = Date.now() - start;
+
+        breaker?.onSuccess();
+        hooks?.onSuccess?.({ name, attempt, timeMs });
+        return result;
+    } catch (err) {
+        const timeMs = Date.now() - start;
+        lastErr = err;
+
+        breaker?.onFailure();
+        hooks?.onFailure?.({ name, attempt, timeMs, error: err });
+
+        const shouldRetry = attempt <= retries && retryOn(err);
+        if (!shouldRetry) throw err;
+
+        const waitMs = computeBackoffMs(config.backoff, attempt);
+        hooks?.onRetry?.({ name, attempt, delayMs: waitMs, error: err });
+        if (waitMs > 0) await delay(waitMs);
+    }
+}
+```
+
+## Configuration Options
+
+### `retries`
+
+The maximum number of retry attempts after the initial execution.
+
+```typescript
+const resilient = withResilience(fetchData, {
+  retries: 3  // Will attempt up to 4 times total (1 initial + 3 retries)
+});
+```
+
+<Note>
+  The total number of attempts is `retries + 1`. Setting `retries: 3` means 4 total attempts.
+</Note>
+
+### `retryOn`
+
+A predicate function that determines whether a specific error should trigger a retry. This gives you fine-grained control over which failures are retryable.
+
+```typescript
+const resilient = withResilience(apiCall, {
+  retries: 3,
+  retryOn: (err) => {
+    // Only retry on network errors, not on validation errors
+    if (err instanceof ValidationError) return false;
+    if (err instanceof NetworkError) return true;
+    return false;
+  }
+});
+```
+
+**Default behavior**: If `retryOn` is not specified, all errors are retryable (from `src/index.ts:119`):
+
+```typescript
+const retryOn = config.retryOn ?? (() => true);
+```
+
+### Selective Retry Examples
+
+<CodeGroup>
+
+```typescript HTTP Status Codes
+const resilient = withResilience(fetchAPI, {
+  retries: 3,
+  retryOn: (err) => {
+    // Retry on 5xx server errors, but not 4xx client errors
+    if (err.response?.status >= 500) return true;
+    return false;
+  }
+});
+```
+
+```typescript Timeout Only
+const resilient = withResilience(slowOperation, {
+  retries: 2,
+  timeoutMs: 5000,
+  retryOn: (err) => {
+    // Only retry timeouts, not other errors
+    return err.message === 'TimeoutError';
+  }
+});
+```
+
+```typescript Custom Error Types
+class RetryableError extends Error {}
+class FatalError extends Error {}
+
+const resilient = withResilience(task, {
+  retries: 5,
+  retryOn: (err) => err instanceof RetryableError
+});
+```
+
+</CodeGroup>
+
+## Complete Example
+
+```typescript
+import { withResilience } from '@oldwhisper/resilience';
+
+async function fetchUserData(userId: string) {
+  const response = await fetch(`https://api.example.com/users/${userId}`);
+  if (!response.ok) throw new Error(`HTTP ${response.status}`);
+  return response.json();
+}
+
+const resilientFetch = withResilience(fetchUserData, {
+  name: 'fetchUserData',
+  retries: 3,
+  backoff: { type: 'exponential', baseDelayMs: 100, maxDelayMs: 2000, jitter: true },
+  retryOn: (err) => {
+    // Retry server errors and timeouts, but not client errors
+    const msg = err.message;
+    return msg.includes('HTTP 5') || msg === 'TimeoutError';
+  },
+  hooks: {
+    onRetry: ({ attempt, delayMs, error }) => {
+      console.log(`Retry attempt ${attempt} after ${delayMs}ms:`, error);
+    }
+  }
+});
+
+try {
+  const userData = await resilientFetch('user-123');
+  console.log('Success:', userData);
+} catch (error) {
+  console.error('All retries exhausted:', error);
+}
+```
+
+## Hooks for Monitoring
+
+Retries trigger specific hooks that let you observe the retry behavior:
+
+- **`onAttempt`**: Called before each attempt (including the initial one)
+- **`onRetry`**: Called when a retry is about to happen, includes the delay
+- **`onFailure`**: Called after each failed attempt
+- **`onSuccess`**: Called when an attempt succeeds
+
+```typescript
+const resilient = withResilience(task, {
+  retries: 3,
+  hooks: {
+    onAttempt: ({ name, attempt }) => {
+      console.log(`[${name}] Attempt ${attempt}`);
+    },
+    onRetry: ({ attempt, delayMs, error }) => {
+      console.log(`Retrying after ${delayMs}ms due to:`, error);
+    },
+    onSuccess: ({ attempt, timeMs }) => {
+      console.log(`Success on attempt ${attempt} (${timeMs}ms)`);
+    },
+    onFailure: ({ attempt, error }) => {
+      console.log(`Attempt ${attempt} failed:`, error);
+    }
+  }
+});
+```
+
+## Best Practices
+
+<Info>
+  **Combine with Backoff**: Always use retries with a [backoff strategy](/concepts/backoff) to avoid overwhelming the failing service.
+</Info>
+
+1. **Set reasonable limits**: Don't retry indefinitely. 3-5 retries is usually sufficient.
+2. **Use `retryOn` wisely**: Only retry transient errors, not validation or authentication failures.
+3. **Monitor retry patterns**: Use hooks to track retry rates and identify systemic issues.
+4. **Consider timeouts**: Combine with [timeouts](/concepts/timeouts) to prevent indefinite waits.
+5. **Respect idempotency**: Only retry operations that are safe to execute multiple times.
+
+## Related Concepts
+
+- [Backoff Strategies](/concepts/backoff) - Control the delay between retry attempts
+- [Timeouts](/concepts/timeouts) - Prevent individual attempts from hanging indefinitely
+- [Circuit Breakers](/concepts/circuit-breaker) - Stop retrying when a service is consistently failing

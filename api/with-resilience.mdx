@@ -1,0 +1,214 @@
+---
+title: 'withResilience'
+description: 'Core function that wraps any function with resilience capabilities'
+---
+
+## Overview
+
+The `withResilience` function is the main entry point for adding resilience patterns to your functions. It wraps any function with retry logic, timeouts, backoff strategies, circuit breakers, and lifecycle hooks.
+
+## Function Signature
+
+```typescript
+function withResilience<Fn extends (...args: any[]) => any>(
+  fn: Fn,
+  config?: ResilienceConfig
+): (...args: Parameters<Fn>) => Promise<Awaited<ReturnType<Fn>>>
+```
+
+## Parameters
+
+<ParamField path="fn" type="Fn extends (...args: any[]) => any" required>
+  The function to wrap with resilience behavior. Can be synchronous or asynchronous.
+</ParamField>
+
+<ParamField path="config" type="ResilienceConfig" default="{}">
+  Configuration object for resilience behavior. See [Configuration](/api/configuration) for all available options.
+  
+  <Expandable title="config properties">
+    <ResponseField name="name" type="string">
+      Optional name for the function (used in hooks and error messages). Defaults to `fn.name` or "anonymous".
+    </ResponseField>
+    
+    <ResponseField name="retries" type="number" default="0">
+      Number of retry attempts after initial failure.
+    </ResponseField>
+    
+    <ResponseField name="timeoutMs" type="number">
+      Maximum execution time in milliseconds before timing out.
+    </ResponseField>
+    
+    <ResponseField name="backoff" type="BackoffStrategy">
+      Backoff strategy for retries (fixed or exponential).
+    </ResponseField>
+    
+    <ResponseField name="retryOn" type="(err: unknown) => boolean">
+      Predicate function to determine if an error should trigger a retry. Defaults to always retry.
+    </ResponseField>
+    
+    <ResponseField name="circuitBreaker" type="CircuitBreakerConfig">
+      Circuit breaker configuration to prevent cascading failures.
+    </ResponseField>
+    
+    <ResponseField name="hooks" type="ResilienceHooks">
+      Lifecycle hooks for observability and metrics. See [Hooks](/api/hooks).
+    </ResponseField>
+    
+    <ResponseField name="useAbortSignal" type="boolean" default="false">
+      Enable automatic abort signal management for cancellation support.
+    </ResponseField>
+  </Expandable>
+</ParamField>
+
+## Return Value
+
+<ResponseField name="wrappedFunction" type="(...args: Parameters<Fn>) => Promise<Awaited<ReturnType<Fn>>>">
+  A wrapped version of the original function that:
+  - Returns a Promise (even if the original function was synchronous)
+  - Maintains the same parameter types as the original function
+  - Returns the same type as the original function (unwrapped from Promise if needed)
+  - Implements all configured resilience patterns
+</ResponseField>
+
+## Examples
+
+### Basic Retry
+
+```typescript
+import { withResilience } from '@your-org/resilience';
+
+const fetchUser = async (id: string) => {
+  const response = await fetch(`/api/users/${id}`);
+  return response.json();
+};
+
+const resilientFetchUser = withResilience(fetchUser, {
+  retries: 3,
+  backoff: {
+    type: 'exponential',
+    baseDelayMs: 100,
+    maxDelayMs: 5000,
+    jitter: true
+  }
+});
+
+// Use it like the original function
+const user = await resilientFetchUser('123');
+```
+
+### With Timeout and Circuit Breaker
+
+```typescript
+const callExternalAPI = withResilience(
+  async (endpoint: string) => {
+    return await fetch(endpoint).then(r => r.json());
+  },
+  {
+    name: 'external-api-call',
+    retries: 2,
+    timeoutMs: 3000,
+    circuitBreaker: {
+      failureThreshold: 5,
+      resetTimeoutMs: 60000 // 1 minute
+    },
+    retryOn: (err) => {
+      // Only retry on network errors, not 4xx responses
+      return err instanceof TypeError;
+    }
+  }
+);
+```
+
+### With Hooks for Metrics
+
+```typescript
+const processData = withResilience(
+  async (data: any[]) => {
+    // Processing logic
+    return data.map(item => transform(item));
+  },
+  {
+    name: 'data-processor',
+    retries: 3,
+    hooks: {
+      onAttempt: ({ name, attempt }) => {
+        console.log(`[${name}] Attempt ${attempt}`);
+      },
+      onSuccess: ({ name, attempt, timeMs }) => {
+        metrics.recordSuccess(name, timeMs, attempt);
+      },
+      onFailure: ({ name, attempt, timeMs, error }) => {
+        metrics.recordFailure(name, timeMs, attempt, error);
+      },
+      onRetry: ({ name, attempt, delayMs, error }) => {
+        console.warn(`[${name}] Retrying after ${delayMs}ms due to:`, error);
+      }
+    }
+  }
+);
+```
+
+### With Abort Signal Support
+
+```typescript
+const longRunningTask = withResilience(
+  async (taskId: string) => {
+    // This function can use resilientFetch and sleep
+    // which will automatically be cancelled on timeout
+    await sleep(1000);
+    const result = await resilientFetch(`/api/tasks/${taskId}`);
+    await sleep(1000);
+    return result.json();
+  },
+  {
+    name: 'long-task',
+    retries: 2,
+    timeoutMs: 5000,
+    useAbortSignal: true // Enable automatic cancellation
+  }
+);
+```
+
+## Error Handling
+
+The wrapped function will throw errors in the following cases:
+
+- **TimeoutError**: When execution exceeds `timeoutMs`
+- **CircuitOpenError**: When the circuit breaker is open and blocks execution
+- **Original Error**: When retries are exhausted or `retryOn` returns false
+
+```typescript
+try {
+  await resilientFunction();
+} catch (error) {
+  if (error.message === 'TimeoutError') {
+    // Handle timeout
+  } else if (error.message.startsWith('CircuitOpenError')) {
+    // Handle circuit breaker
+  } else {
+    // Handle original error
+  }
+}
+```
+
+## Implementation Details
+
+From `src/index.ts:113-168`, the function:
+
+1. Creates a circuit breaker if configured
+2. Wraps the function with retry logic (attempts = retries + 1)
+3. For each attempt:
+   - Calls `onAttempt` hook
+   - Checks if circuit breaker allows execution
+   - Creates an AbortController if `useAbortSignal` is enabled
+   - Executes the function with timeout wrapper
+   - Calls `onSuccess` hook on success
+   - Calls `onFailure` hook on failure
+   - Determines if retry should occur based on `retryOn`
+   - Waits for backoff delay before next attempt
+
+## Related
+
+- [Configuration](/api/configuration) - Full configuration reference
+- [Hooks](/api/hooks) - Lifecycle hooks for observability
+- [WrapperInit](/api/wrapper-init) - Helper class for metrics tracking

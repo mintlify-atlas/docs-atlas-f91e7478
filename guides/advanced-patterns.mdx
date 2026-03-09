@@ -1,0 +1,575 @@
+---
+title: 'Advanced Patterns'
+description: 'Complex real-world scenarios combining multiple resilience features'
+icon: 'wand-magic-sparkles'
+---
+
+## Overview
+
+This guide covers advanced patterns for using Resilience in production environments, including combining multiple features, custom implementations, and performance optimization.
+
+## Multi-Layer Resilience
+
+Combine multiple resilience wrappers for different concerns:
+
+```typescript
+import { withResilience, WrapperInit } from '@oldwhisper/resilience';
+
+const metrics = new WrapperInit();
+
+// Layer 1: Network resilience with aggressive retries
+const networkResilient = withResilience(fetchFromAPI, {
+  name: 'networkLayer',
+  retries: 5,
+  timeoutMs: 3000,
+  backoff: {
+    type: 'exponential',
+    baseDelayMs: 100,
+    maxDelayMs: 2000,
+    jitter: true
+  },
+  retryOn: (error) => {
+    // Only retry network and transient errors
+    return error instanceof TypeError || 
+           (error instanceof Error && error.message.includes('5'));
+  }
+});
+
+// Layer 2: Circuit breaker for service health
+const serviceResilient = withResilience(networkResilient, {
+  name: 'serviceLayer',
+  circuitBreaker: {
+    failureThreshold: 10,
+    resetTimeoutMs: 60000
+  },
+  hooks: {
+    onCircuitOpen: () => {
+      console.error('Service circuit breaker opened!');
+      alerting.critical('API service is down');
+    }
+  }
+});
+
+// Layer 3: Metrics tracking
+const fullyResilient = metrics.wrap(serviceResilient, {
+  name: 'apiCall'
+});
+
+// Use the fully resilient function
+await fullyResilient('/api/data');
+```
+
+<Note>
+  Be careful with multiple retry layers - total retry count multiplies! In the example above, 5 retries × potentially multiple service-level attempts could lead to many calls.
+</Note>
+
+## Fallback Patterns
+
+Provide alternative data sources when primary sources fail:
+
+### Simple Fallback
+
+```typescript
+import { withResilience } from '@oldwhisper/resilience';
+
+const primaryAPI = withResilience(fetchFromPrimary, {
+  name: 'primaryAPI',
+  retries: 2,
+  timeoutMs: 3000
+});
+
+const secondaryAPI = withResilience(fetchFromSecondary, {
+  name: 'secondaryAPI',
+  retries: 1,
+  timeoutMs: 5000
+});
+
+async function fetchWithFallback(query: string) {
+  try {
+    return await primaryAPI(query);
+  } catch (primaryError) {
+    console.warn('Primary API failed, trying secondary');
+    try {
+      return await secondaryAPI(query);
+    } catch (secondaryError) {
+      console.error('Both APIs failed');
+      // Return cached data or default
+      return getCachedData(query);
+    }
+  }
+}
+```
+
+### Cache-Aside Pattern
+
+```typescript
+import { withResilience } from '@oldwhisper/resilience';
+
+interface CacheStore {
+  get(key: string): Promise<any | null>;
+  set(key: string, value: any, ttl: number): Promise<void>;
+}
+
+function createCachedResilient<T>(
+  fn: (key: string) => Promise<T>,
+  cache: CacheStore,
+  options: {
+    cacheTTL: number;
+    resilience: any;
+  }
+) {
+  const resilientFn = withResilience(fn, options.resilience);
+
+  return async (key: string): Promise<T> => {
+    // Try cache first
+    const cached = await cache.get(key);
+    if (cached !== null) {
+      console.log('Cache hit:', key);
+      return cached;
+    }
+
+    // Cache miss - fetch with resilience
+    console.log('Cache miss, fetching:', key);
+    const data = await resilientFn(key);
+
+    // Update cache
+    await cache.set(key, data, options.cacheTTL);
+
+    return data;
+  };
+}
+
+// Usage
+const cachedAPI = createCachedResilient(
+  fetchUserData,
+  myCache,
+  {
+    cacheTTL: 300, // 5 minutes
+    resilience: {
+      name: 'userData',
+      retries: 3,
+      timeoutMs: 5000,
+      circuitBreaker: {
+        failureThreshold: 5,
+        resetTimeoutMs: 30000
+      }
+    }
+  }
+);
+
+const user = await cachedAPI('user-123');
+```
+
+## Abort Signal Patterns
+
+Use abort signals to cancel long-running operations:
+
+### Automatic Cancellation with Timeout
+
+```typescript
+import { withResilience, sleep, resilientFetch } from '@oldwhisper/resilience';
+
+async function processWithSteps(data: string) {
+  // Step 1: Fetch data
+  const response = await resilientFetch('https://api.example.com/process', {
+    method: 'POST',
+    body: JSON.stringify({ data })
+  });
+  const result = await response.json();
+
+  // Step 2: Wait before polling
+  await sleep(1000); // Uses active signal automatically
+
+  // Step 3: Poll for completion
+  const status = await resilientFetch(`https://api.example.com/status/${result.id}`);
+  return status.json();
+}
+
+const resilientProcess = withResilience(processWithSteps, {
+  name: 'processWithSteps',
+  timeoutMs: 10000,      // Total timeout for all steps
+  useAbortSignal: true,  // Enable abort signal
+  retries: 2
+});
+
+try {
+  const result = await resilientProcess('my-data');
+  console.log('Completed:', result);
+} catch (error) {
+  if (error instanceof Error && error.message === 'Aborted') {
+    console.log('Operation was cancelled due to timeout');
+  }
+}
+```
+
+<Tip>
+  When `useAbortSignal: true`, both `sleep()` and `resilientFetch()` automatically respect the timeout and cancel immediately when the timeout is reached.
+</Tip>
+
+### Manual Abort Control
+
+```typescript
+import { sleep } from '@oldwhisper/resilience';
+
+async function longRunningTask() {
+  const controller = new AbortController();
+
+  // Start task
+  const taskPromise = (async () => {
+    for (let i = 0; i < 10; i++) {
+      await sleep(1000, controller.signal);
+      console.log(`Step ${i + 1} complete`);
+    }
+  })();
+
+  // Cancel after 5 seconds
+  setTimeout(() => {
+    console.log('Cancelling task...');
+    controller.abort();
+  }, 5000);
+
+  try {
+    await taskPromise;
+    console.log('Task completed');
+  } catch (error) {
+    if (error instanceof Error && error.message === 'Aborted') {
+      console.log('Task was cancelled');
+    }
+  }
+}
+```
+
+## Custom Metrics Aggregation
+
+Build sophisticated metrics systems:
+
+```typescript
+import { withResilience } from '@oldwhisper/resilience';
+
+class AggregatedMetrics {
+  private windows = new Map<string, {
+    successes: number[];
+    failures: number[];
+    durations: number[];
+  }>();
+  private windowSize = 100; // Keep last 100 data points
+
+  record(name: string, type: 'success' | 'failure', duration: number) {
+    if (!this.windows.has(name)) {
+      this.windows.set(name, {
+        successes: [],
+        failures: [],
+        durations: []
+      });
+    }
+
+    const window = this.windows.get(name)!;
+    
+    if (type === 'success') {
+      window.successes.push(Date.now());
+      if (window.successes.length > this.windowSize) {
+        window.successes.shift();
+      }
+    } else {
+      window.failures.push(Date.now());
+      if (window.failures.length > this.windowSize) {
+        window.failures.shift();
+      }
+    }
+
+    window.durations.push(duration);
+    if (window.durations.length > this.windowSize) {
+      window.durations.shift();
+    }
+  }
+
+  getSuccessRate(name: string): number {
+    const window = this.windows.get(name);
+    if (!window) return 0;
+    
+    const total = window.successes.length + window.failures.length;
+    if (total === 0) return 0;
+    
+    return (window.successes.length / total) * 100;
+  }
+
+  getPercentile(name: string, percentile: number): number {
+    const window = this.windows.get(name);
+    if (!window || window.durations.length === 0) return 0;
+
+    const sorted = [...window.durations].sort((a, b) => a - b);
+    const index = Math.ceil((percentile / 100) * sorted.length) - 1;
+    return sorted[index];
+  }
+
+  getAverageDuration(name: string): number {
+    const window = this.windows.get(name);
+    if (!window || window.durations.length === 0) return 0;
+
+    const sum = window.durations.reduce((a, b) => a + b, 0);
+    return sum / window.durations.length;
+  }
+
+  hooks() {
+    return {
+      onSuccess: ({ name, timeMs }: { name: string; timeMs: number }) => {
+        this.record(name, 'success', timeMs);
+      },
+      onFailure: ({ name, timeMs }: { name: string; timeMs: number }) => {
+        this.record(name, 'failure', timeMs);
+      }
+    };
+  }
+}
+
+// Usage
+const metrics = new AggregatedMetrics();
+
+const apiCall = withResilience(fetchData, {
+  name: 'api',
+  retries: 3,
+  hooks: metrics.hooks()
+});
+
+// Make calls
+for (let i = 0; i < 50; i++) {
+  try {
+    await apiCall();
+  } catch (error) {
+    // Continue
+  }
+}
+
+// Analyze metrics
+console.log('Success rate:', metrics.getSuccessRate('api') + '%');
+console.log('Average duration:', metrics.getAverageDuration('api') + 'ms');
+console.log('P50:', metrics.getPercentile('api', 50) + 'ms');
+console.log('P95:', metrics.getPercentile('api', 95) + 'ms');
+console.log('P99:', metrics.getPercentile('api', 99) + 'ms');
+```
+
+## Rate Limiting Integration
+
+Combine with rate limiters for API quota management:
+
+```typescript
+import { withResilience } from '@oldwhisper/resilience';
+
+class RateLimiter {
+  private tokens: number;
+  private lastRefill: number;
+  private refillRate: number; // tokens per second
+  private capacity: number;
+
+  constructor(tokensPerSecond: number, capacity: number) {
+    this.refillRate = tokensPerSecond;
+    this.capacity = capacity;
+    this.tokens = capacity;
+    this.lastRefill = Date.now();
+  }
+
+  private refill() {
+    const now = Date.now();
+    const elapsed = (now - this.lastRefill) / 1000;
+    const tokensToAdd = elapsed * this.refillRate;
+    
+    this.tokens = Math.min(this.capacity, this.tokens + tokensToAdd);
+    this.lastRefill = now;
+  }
+
+  async acquire(): Promise<void> {
+    this.refill();
+    
+    if (this.tokens >= 1) {
+      this.tokens -= 1;
+      return;
+    }
+
+    // Wait for next token
+    const waitMs = ((1 - this.tokens) / this.refillRate) * 1000;
+    await new Promise(resolve => setTimeout(resolve, waitMs));
+    
+    this.tokens = 0;
+  }
+}
+
+function createRateLimitedResilient<Fn extends (...args: any[]) => any>(
+  fn: Fn,
+  limiter: RateLimiter,
+  config: any
+) {
+  const resilientFn = withResilience(fn, config);
+
+  return async (...args: Parameters<Fn>) => {
+    await limiter.acquire();
+    return resilientFn(...args);
+  };
+}
+
+// Usage
+const limiter = new RateLimiter(10, 10); // 10 requests per second, burst of 10
+
+const rateLimitedAPI = createRateLimitedResilient(
+  callAPI,
+  limiter,
+  {
+    name: 'rateLimitedAPI',
+    retries: 3,
+    retryOn: (error) => {
+      // Don't retry rate limit errors - the limiter handles this
+      if (error instanceof Error && error.message.includes('429')) {
+        return false;
+      }
+      return true;
+    }
+  }
+);
+```
+
+## Bulkhead Pattern
+
+Isolate resource pools to prevent cascade failures:
+
+```typescript
+import { withResilience } from '@oldwhisper/resilience';
+
+class Bulkhead {
+  private activeCount = 0;
+  private queue: Array<() => void> = [];
+
+  constructor(private maxConcurrent: number) {}
+
+  async acquire(): Promise<void> {
+    if (this.activeCount < this.maxConcurrent) {
+      this.activeCount++;
+      return;
+    }
+
+    // Wait in queue
+    await new Promise<void>(resolve => {
+      this.queue.push(resolve);
+    });
+  }
+
+  release(): void {
+    this.activeCount--;
+    const next = this.queue.shift();
+    if (next) {
+      this.activeCount++;
+      next();
+    }
+  }
+
+  async execute<T>(fn: () => Promise<T>): Promise<T> {
+    await this.acquire();
+    try {
+      return await fn();
+    } finally {
+      this.release();
+    }
+  }
+}
+
+// Create separate bulkheads for different services
+const databaseBulkhead = new Bulkhead(10);
+const apiBulkhead = new Bulkhead(20);
+
+const resilientDBQuery = withResilience(
+  async (query: string) => {
+    return databaseBulkhead.execute(() => db.query(query));
+  },
+  {
+    name: 'dbQuery',
+    retries: 2,
+    timeoutMs: 10000,
+    circuitBreaker: {
+      failureThreshold: 5,
+      resetTimeoutMs: 30000
+    }
+  }
+);
+
+const resilientAPICall = withResilience(
+  async (endpoint: string) => {
+    return apiBulkhead.execute(() => fetch(endpoint).then(r => r.json()));
+  },
+  {
+    name: 'apiCall',
+    retries: 3,
+    timeoutMs: 5000
+  }
+);
+```
+
+<Note>
+  Bulkheads prevent resource exhaustion by limiting concurrent operations. Even if the API fails, it won't consume all available connections and affect database queries.
+</Note>
+
+## Performance Optimization
+
+### Minimize Hook Overhead
+
+```typescript
+// ✗ Inefficient - creates new objects on every call
+const slow = withResilience(fn, {
+  hooks: {
+    onAttempt: ({ name, attempt }) => {
+      const data = { name, attempt, timestamp: Date.now() };
+      logger.log(JSON.stringify(data));
+    }
+  }
+});
+
+// ✓ Efficient - minimal allocations
+const fast = withResilience(fn, {
+  hooks: {
+    onAttempt: ({ name, attempt }) => {
+      // Log directly without creating intermediate objects
+      if (shouldLog) {
+        logger.log(name, attempt);
+      }
+    }
+  }
+});
+```
+
+### Conditional Metrics
+
+```typescript
+const isDevelopment = process.env.NODE_ENV === 'development';
+
+const resilientFn = withResilience(fn, {
+  name: 'fn',
+  retries: 3,
+  // Only track metrics in production
+  hooks: isDevelopment ? undefined : metrics.hooks()
+});
+```
+
+### Reuse Resilient Wrappers
+
+```typescript
+// ✗ Bad - creates new wrapper on every call
+function fetchUser(id: string) {
+  const resilient = withResilience(actualFetch, config);
+  return resilient(id);
+}
+
+// ✓ Good - create wrapper once
+const resilientFetch = withResilience(actualFetch, config);
+
+function fetchUser(id: string) {
+  return resilientFetch(id);
+}
+```
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="API Reference" icon="code" href="/api/with-resilience">
+    Complete API documentation
+  </Card>
+  <Card title="Metrics Tracking" icon="chart-line" href="/guides/metrics-tracking">
+    Deep dive into monitoring and observability
+  </Card>
+</CardGroup>

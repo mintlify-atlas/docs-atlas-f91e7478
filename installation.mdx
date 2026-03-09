@@ -1,0 +1,158 @@
+---
+title: Installation
+description: Install and configure Resilience in your project
+---
+
+## Install the package
+
+Resilience is available on npm and can be installed using any package manager:
+
+<CodeGroup>
+  ```bash npm
+  npm install @oldwhisper/resilience
+  ```
+
+  ```bash yarn
+  yarn add @oldwhisper/resilience
+  ```
+
+  ```bash pnpm
+  pnpm add @oldwhisper/resilience
+  ```
+</CodeGroup>
+
+## Requirements
+
+- **Node.js**: 16.x or higher
+- **TypeScript**: 5.x or higher (optional, but recommended)
+
+<Note>
+  Resilience is an ESM-only package. Make sure your project is configured to use ES modules.
+</Note>
+
+## TypeScript setup
+
+Resilience is written in TypeScript and includes type definitions out of the box. No additional setup is required.
+
+The library exports all type definitions you need:
+
+```typescript
+import type { 
+  ResilienceConfig,
+  BackoffStrategy,
+  CircuitBreakerConfig,
+  ResilienceHooks 
+} from '@oldwhisper/resilience';
+```
+
+### Type definitions included
+
+Resilience provides full TypeScript support with these key types:
+
+- `ResilienceConfig` - Configuration options for `withResilience`
+- `BackoffStrategy` - Fixed or exponential backoff configuration
+- `CircuitBreakerConfig` - Circuit breaker threshold and timeout settings
+- `ResilienceHooks` - Lifecycle hooks for observability
+- `CircuitState` - Circuit breaker state (`CLOSED`, `OPEN`, `HALF_OPEN`)
+
+## ESM configuration
+
+Since Resilience is an ESM package, ensure your `package.json` includes:
+
+```json
+{
+  "type": "module"
+}
+```
+
+If you're using TypeScript, your `tsconfig.json` should have:
+
+```json
+{
+  "compilerOptions": {
+    "module": "ESNext",
+    "moduleResolution": "node"
+  }
+}
+```
+
+## Verify installation
+
+Create a simple test file to verify everything is working:
+
+<CodeGroup>
+  ```typescript test.ts
+  import { withResilience } from '@oldwhisper/resilience';
+
+  const greet = withResilience(
+    (name: string) => `Hello, ${name}!`,
+    { 
+      name: 'greet',
+      retries: 1 
+    }
+  );
+
+  const result = await greet('World');
+  console.log(result); // "Hello, World!"
+  ```
+
+  ```javascript test.js
+  import { withResilience } from '@oldwhisper/resilience';
+
+  const greet = withResilience(
+    (name) => `Hello, ${name}!`,
+    { 
+      name: 'greet',
+      retries: 1 
+    }
+  );
+
+  const result = await greet('World');
+  console.log(result); // "Hello, World!"
+  ```
+</CodeGroup>
+
+Run the test:
+
+```bash
+node test.js
+```
+
+If you see "Hello, World!" printed, your installation is successful!
+
+## Bundle size
+
+Resilience is lightweight and has zero dependencies:
+
+- **Uncompressed**: ~8 KB
+- **Minified**: ~3 KB
+- **Gzipped**: ~1.5 KB
+
+This makes it perfect for:
+- Browser applications
+- Serverless functions (AWS Lambda, Cloudflare Workers, etc.)
+- Edge computing environments
+- Microservices where bundle size matters
+
+## Environment support
+
+Resilience works in any JavaScript environment that supports:
+
+- Promises and async/await
+- `setTimeout` and `Date.now()`
+- `AbortController` and `AbortSignal` (optional, for timeout cancellation)
+
+<Tip>
+  Resilience uses `AbortController` for timeout cancellation when `useAbortSignal` is enabled. This feature requires an environment that supports the AbortController API (Node.js 15+, all modern browsers).
+</Tip>
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Get started with your first resilient function
+  </Card>
+  <Card title="Core concepts" icon="book" href="/concepts/retries">
+    Learn about retries, backoff, and circuit breakers
+  </Card>
+</CardGroup>

@@ -1,0 +1,81 @@
+---
+title: Introduction
+description: A lightweight resilience toolkit for JavaScript and TypeScript applications
+---
+
+## What is Resilience?
+
+Resilience is a lightweight toolkit that makes your JavaScript and TypeScript functions more robust and fault-tolerant. It provides a simple wrapper system that adds retry logic, timeouts, backoff strategies, circuit breakers, and observability hooks to any function.
+
+Unlike heavyweight resilience frameworks, Resilience is designed to be minimal, dependency-free, and easy to integrate into existing codebases.
+
+## Key features
+
+<CardGroup cols={2}>
+  <Card title="Retry with backoff" icon="arrows-rotate">
+    Automatically retry failed operations with configurable fixed or exponential backoff strategies
+  </Card>
+  <Card title="Timeouts" icon="clock">
+    Set maximum execution time for operations to prevent hanging requests
+  </Card>
+  <Card title="Circuit breaker" icon="plug-circle-xmark">
+    Automatically stop calling failing services to give them time to recover
+  </Card>
+  <Card title="Observability hooks" icon="chart-line">
+    Built-in lifecycle hooks for metrics collection and monitoring
+  </Card>
+</CardGroup>
+
+## Why Resilience?
+
+### Handle transient failures gracefully
+
+Network requests, database queries, and external API calls can fail temporarily due to network issues, service overload, or rate limiting. Resilience automatically retries these operations with intelligent backoff strategies.
+
+### Prevent cascading failures
+
+When a downstream service fails, the circuit breaker pattern prevents your application from repeatedly calling it, giving the failing service time to recover and protecting your application from resource exhaustion.
+
+### Zero dependencies
+
+Resilience has no external dependencies and weighs just a few kilobytes, making it perfect for serverless functions, edge computing, and browser applications.
+
+## Common use cases
+
+- **API clients**: Retry failed HTTP requests with exponential backoff
+- **Database operations**: Handle transient connection failures
+- **Microservices**: Implement circuit breakers between services
+- **Background jobs**: Add timeouts and retry logic to task processors
+- **Serverless functions**: Make cloud functions more resilient to cold starts and network issues
+
+## Example
+
+Here's a quick example of wrapping a function with resilience features:
+
+```typescript
+import { withResilience } from '@oldwhisper/resilience';
+
+const fetchUser = withResilience(
+  async (userId: string) => {
+    const response = await fetch(`/api/users/${userId}`);
+    return response.json();
+  },
+  {
+    retries: 3,
+    timeoutMs: 5000,
+    backoff: { type: 'exponential', baseDelayMs: 100, maxDelayMs: 2000 },
+    hooks: {
+      onRetry: ({ attempt, delayMs }) => 
+        console.log(`Retry ${attempt} after ${delayMs}ms`)
+    }
+  }
+);
+
+const user = await fetchUser('123');
+```
+
+## Next steps
+
+<Card title="Quickstart" icon="rocket" href="/quickstart">
+  Get started with Resilience in under 5 minutes
+</Card>

@@ -1,97 +1,114 @@
 ---
-title: "Introduction"
-description: "Welcome to the new home for your documentation"
+title: "Resilience"
+description: "Lightweight resilience toolkit for JavaScript/TypeScript"
 ---
 
-## Setting up
+<div style={{
+  background: 'linear-gradient(135deg, #cb0404 0%, #e37b84 100%)',
+  borderRadius: '24px',
+  padding: '60px 40px',
+  marginBottom: '40px',
+  color: 'white'
+}}>
+  <h1 style={{
+    fontSize: '56px',
+    fontWeight: '700',
+    marginBottom: '20px',
+    color: 'white'
+  }}>
+    Resilience
+  </h1>
+  <p style={{
+    fontSize: '20px',
+    opacity: '0.95',
+    maxWidth: '700px',
+    lineHeight: '1.6'
+  }}>
+    Lightweight resilience toolkit for JavaScript/TypeScript: retries, timeouts, backoff, circuit breaker, and metrics hooks—simple to wrap any function.
+  </p>
+</div>
 
-Get your documentation site up and running in minutes.
+## Key Features
 
-<Card
-  title="Start here"
-  icon="rocket"
-  href="/quickstart"
-  horizontal
->
-  Follow our three step quickstart guide.
-</Card>
-
-## Make it yours
-
-Design a docs site that looks great and empowers your users.
-
-<Columns cols={2}>
-  <Card
-    title="Edit locally"
-    icon="pen-to-square"
-    href="/development"
-  >
-    Edit your docs locally and preview them in real time.
+<CardGroup cols={2}>
+  <Card title="Retry Logic" icon="arrows-rotate">
+    Configure automatic retries with custom retry conditions to handle transient failures gracefully.
   </Card>
-  <Card
-    title="Customize your site"
-    icon="palette"
-    href="/essentials/settings"
-  >
-    Customize the design and colors of your site to match your brand.
+  <Card title="Smart Timeouts" icon="clock">
+    Set timeout limits with abort signal support to prevent hanging operations.
   </Card>
-    <Card
-    title="Set up navigation"
-    icon="map"
-    href="/essentials/navigation"
-  >
-    Organize your docs to help users find what they need and succeed with your product.
+  <Card title="Backoff Strategies" icon="chart-line">
+    Choose between fixed or exponential backoff with optional jitter to reduce load spikes.
   </Card>
-  <Card
-    title="API documentation"
-    icon="terminal"
-    href="/api-reference/introduction"
-  >
-    Auto-generate API documentation from OpenAPI specifications.
+  <Card title="Circuit Breaker" icon="shield-halved">
+    Implement circuit breaker patterns to prevent cascade failures in distributed systems.
   </Card>
-</Columns>
+  <Card title="Metrics & Observability" icon="chart-mixed">
+    Track execution metrics with customizable hooks for monitoring and debugging.
+  </Card>
+  <Card title="TypeScript-First" icon="code">
+    Full type safety and IntelliSense support with comprehensive TypeScript definitions.
+  </Card>
+</CardGroup>
 
-## Create beautiful pages
+## Quick Start
 
-Everything you need to create world-class documentation.
+Get up and running with Resilience in just a few lines of code.
 
-<Columns cols={2}>
-  <Card
-    title="Write with MDX"
-    icon="pen-fancy"
-    href="/essentials/markdown"
-  >
-    Use MDX to style your docs pages.
-  </Card>
-  <Card
-    title="Code samples"
-    icon="code"
-    href="/essentials/code"
-  >
-    Add sample code to demonstrate how to use your product.
-  </Card>
-  <Card
-    title="Images"
-    icon="image"
-    href="/essentials/images"
-  >
-    Display images and other media.
-  </Card>
-  <Card
-    title="Reusable snippets"
-    icon="recycle"
-    href="/essentials/reusable-snippets"
-  >
-    Write once and reuse across your docs.
-  </Card>
-</Columns>
+<CodeGroup>
 
-## Need inspiration?
+```bash npm
+npm install @oldwhisper/resilience
+```
 
-<Card
-  title="See complete examples"
-  icon="stars"
-  href="https://mintlify.com/customers"
->
-  Browse our showcase of exceptional documentation sites.
-</Card>
+```bash yarn
+yarn add @oldwhisper/resilience
+```
+
+```bash pnpm
+pnpm add @oldwhisper/resilience
+```
+
+</CodeGroup>
+
+```typescript
+import { withResilience } from "@oldwhisper/resilience";
+
+const resilientFetch = withResilience(fetchData, {
+  retries: 3,
+  timeoutMs: 5000,
+  backoff: { type: "exponential", baseDelayMs: 100, maxDelayMs: 2000 }
+});
+
+await resilientFetch();
+```
+
+## Explore the Docs
+
+<CardGroup cols={2}>
+  <Card title="Quick Start" icon="rocket" href="/quickstart">
+    Get started with Resilience in minutes with our step-by-step guide.
+  </Card>
+  <Card title="Core Concepts" icon="book" href="/concepts/retries">
+    Learn about retries, timeouts, backoff strategies, and circuit breakers.
+  </Card>
+  <Card title="API Reference" icon="code" href="/api/with-resilience">
+    Explore the complete API documentation and configuration options.
+  </Card>
+  <Card title="Examples" icon="lightbulb" href="/examples/http-retries">
+    See real-world examples of HTTP retries, database operations, and more.
+  </Card>
+</CardGroup>
+
+## Why Resilience?
+
+Building reliable distributed systems requires handling failures gracefully. Resilience provides a simple, lightweight toolkit to make your functions more robust:
+
+- **Zero Dependencies**: Minimal footprint with no external dependencies
+- **Framework Agnostic**: Works with any JavaScript/TypeScript framework
+- **Production Ready**: Battle-tested patterns for real-world applications
+- **Developer Friendly**: Intuitive API that wraps any function with minimal boilerplate
+
+<Note>
+Resilience is designed to be simple yet powerful. Wrap any function with resilience features without changing its signature or behavior.
+</Note>

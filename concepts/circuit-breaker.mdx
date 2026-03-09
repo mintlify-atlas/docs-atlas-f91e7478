@@ -1,0 +1,475 @@
+---
+title: Circuit Breaker
+description: Prevent cascading failures by automatically stopping requests to failing services
+---
+
+## What is a Circuit Breaker?
+
+A circuit breaker is a resilience pattern that prevents your application from repeatedly trying to execute an operation that's likely to fail. Like an electrical circuit breaker that stops current flow during a fault, a software circuit breaker stops request flow to a failing service.
+
+### The Problem: Cascading Failures
+
+Without circuit breakers:
+
+1. A downstream service starts failing (e.g., database overload)
+2. Your app keeps sending requests + retries
+3. Resources get tied up waiting for timeouts
+4. Your app becomes slow or unresponsive
+5. Upstream services start timing out on requests to you
+6. The failure cascades through the entire system
+
+**With circuit breakers:**
+
+1. A downstream service starts failing
+2. Circuit breaker detects the failure pattern
+3. Circuit "opens" - requests fail fast without attempting
+4. Your app stays responsive
+5. Circuit periodically checks if service recovered
+6. Circuit "closes" when service is healthy again
+
+<Info>
+  Circuit breakers are about **failing fast** rather than wasting time and resources on operations that will likely fail.
+</Info>
+
+## Circuit States
+
+A circuit breaker has three states, defined in `src/global.d.ts:3`:
+
+```typescript
+type CircuitState = "CLOSED" | "OPEN" | "HALF_OPEN";
+```
+
+### CLOSED (Normal Operation)
+
+- **Default state**: Everything is working normally
+- **Behavior**: All requests are allowed through
+- **Failure tracking**: Counts consecutive failures
+- **Transition**: Opens when failures reach `failureThreshold`
+
+```typescript
+canAttempt(): boolean {
+    if (this.state === "CLOSED") return true;
+    // ...
+}
+```
+
+### OPEN (Failing Fast)
+
+- **Protective state**: Service is considered unhealthy
+- **Behavior**: All requests are immediately rejected without attempting
+- **Timer**: Waits for `resetTimeoutMs` before testing recovery
+- **Transition**: Becomes HALF_OPEN after reset timeout expires
+
+From `src/index.ts:42-47`:
+
+```typescript
+const now = Date.now();
+if (this.state === "OPEN" && now - this.openedAt >= this.cfg.resetTimeoutMs) {
+    this.state = "HALF_OPEN";
+    this.hooks?.onCircuitHalfOpen?.({ name: this.name });
+    return true;
+}
+```
+
+### HALF_OPEN (Testing Recovery)
+
+- **Testing state**: Checking if service has recovered
+- **Behavior**: Allows a single request to test the service
+- **Transitions**:
+  - **Success** → CLOSED (service recovered)
+  - **Failure** → OPEN (service still failing)
+
+From `src/index.ts:51-56`:
+
+```typescript
+onSuccess() {
+    if (this.state !== "CLOSED") {
+        this.state = "CLOSED";
+        this.hooks?.onCircuitClosed?.({ name: this.name });
+    }
+    this.failures = 0;
+}
+```
+
+## State Transition Diagram
+
+```
+        ┌─────────┐
+        │ CLOSED  │ ◄──────────────────┐
+        └────┬────┘                    │
+             │                         │
+             │ failures ≥ threshold    │ success
+             │                         │
+             ▼                         │
+        ┌─────────┐                ┌──┴───────┐
+        │  OPEN   │───────────────►│HALF_OPEN │
+        └─────────┘  after reset   └──────────┘
+                      timeout           │
+                                        │ failure
+                                        │
+                                        ▼
+                                   (back to OPEN)
+```
+
+## Configuration
+
+Circuit breakers are configured via the `circuitBreaker` option, with type defined in `src/global.d.ts:19-22`:
+
+```typescript
+type CircuitBreakerConfig = {
+    failureThreshold: number;   // Failures before opening
+    resetTimeoutMs: number;     // Wait time before testing recovery
+};
+```
+
+### `failureThreshold`
+
+The number of consecutive failures that will open the circuit.
+
+```typescript
+import { withResilience } from '@oldwhisper/resilience';
+
+const resilient = withResilience(apiCall, {
+  circuitBreaker: {
+    failureThreshold: 5,  // Open after 5 consecutive failures
+    resetTimeoutMs: 30000
+  }
+});
+```
+
+**Implementation** (from `src/index.ts:59-66`):
+
+```typescript
+onFailure() {
+    this.failures += 1;
+    if (this.failures >= this.cfg.failureThreshold) {
+        this.state = "OPEN";
+        this.openedAt = Date.now();
+        this.hooks?.onCircuitOpen?.({ name: this.name });
+    }
+}
+```
+
+<Note>
+  The failure counter resets to 0 on any successful attempt. Only **consecutive** failures count toward the threshold.
+</Note>
+
+### `resetTimeoutMs`
+
+How long to wait (in milliseconds) before testing if the service has recovered.
+
+```typescript
+const resilient = withResilience(databaseQuery, {
+  circuitBreaker: {
+    failureThreshold: 3,
+    resetTimeoutMs: 60000  // Wait 1 minute before testing recovery
+  }
+});
+```
+
+**Too short**: Circuit tests recovery too frequently, potentially re-opening quickly  
+**Too long**: Application waits unnecessarily long before attempting recovery
+
+**Recommended values**: 30-60 seconds for most services
+
+## Circuit Breaker Implementation
+
+The full circuit breaker class from `src/index.ts:28-67`:
+
+```typescript
+class CircuitBreaker {
+    private state: Resilience.CircuitState = "CLOSED";
+    private failures = 0;
+    private openedAt = 0;
+
+    constructor(
+        private cfg: Resilience.CircuitBreakerConfig,
+        private hooks?: Resilience.ResilienceHooks,
+        private name = "fn"
+    ) { }
+
+    canAttempt(): boolean {
+        if (this.state === "CLOSED") return true;
+
+        const now = Date.now();
+        if (this.state === "OPEN" && now - this.openedAt >= this.cfg.resetTimeoutMs) {
+            this.state = "HALF_OPEN";
+            this.hooks?.onCircuitHalfOpen?.({ name: this.name });
+            return true;
+        }
+        return this.state === "HALF_OPEN";
+    }
+
+    onSuccess() {
+        if (this.state !== "CLOSED") {
+            this.state = "CLOSED";
+            this.hooks?.onCircuitClosed?.({ name: this.name });
+        }
+        this.failures = 0;
+    }
+
+    onFailure() {
+        this.failures += 1;
+        if (this.failures >= this.cfg.failureThreshold) {
+            this.state = "OPEN";
+            this.openedAt = Date.now();
+            this.hooks?.onCircuitOpen?.({ name: this.name });
+        }
+    }
+}
+```
+
+### Integration with Resilience
+
+The circuit breaker is checked before each attempt (from `src/index.ts:132-136`):
+
+```typescript
+if (breaker && !breaker.canAttempt()) {
+    const e = new Error(`CircuitOpenError: ${name}`);
+    lastErr = e;
+    throw e;
+}
+```
+
+And updated after each attempt:
+
+```typescript
+// On success (line 147):
+breaker?.onSuccess();
+
+// On failure (line 154):
+breaker?.onFailure();
+```
+
+## Complete Example
+
+```typescript
+import { withResilience } from '@oldwhisper/resilience';
+
+interface ApiResponse {
+  data: any;
+}
+
+async function callPaymentAPI(orderId: string): Promise<ApiResponse> {
+  const response = await fetch(`https://payments.example.com/orders/${orderId}`);
+  
+  if (!response.ok) {
+    throw new Error(`Payment API error: ${response.status}`);
+  }
+  
+  return response.json();
+}
+
+const resilientPayment = withResilience(callPaymentAPI, {
+  name: 'paymentAPI',
+  
+  // Timeout per attempt
+  timeoutMs: 5000,
+  
+  // Retry configuration
+  retries: 3,
+  backoff: {
+    type: 'exponential',
+    baseDelayMs: 500,
+    maxDelayMs: 5000,
+    jitter: true
+  },
+  
+  // Circuit breaker
+  circuitBreaker: {
+    failureThreshold: 5,   // Open circuit after 5 failures
+    resetTimeoutMs: 60000  // Test recovery after 1 minute
+  },
+  
+  // Only retry server errors and timeouts
+  retryOn: (err) => {
+    const msg = err.message;
+    return msg.includes('500') || 
+           msg.includes('502') || 
+           msg.includes('503') ||
+           msg === 'TimeoutError';
+  },
+  
+  // Monitoring hooks
+  hooks: {
+    onCircuitOpen: ({ name }) => {
+      console.error(`🔴 Circuit OPENED for ${name} - failing fast`);
+      // Alert ops team
+    },
+    onCircuitHalfOpen: ({ name }) => {
+      console.warn(`🟡 Circuit HALF_OPEN for ${name} - testing recovery`);
+    },
+    onCircuitClosed: ({ name }) => {
+      console.info(`🟢 Circuit CLOSED for ${name} - service recovered`);
+    },
+    onFailure: ({ attempt, error }) => {
+      console.error(`Attempt ${attempt} failed:`, error.message);
+    }
+  }
+});
+
+// Usage
+try {
+  const result = await resilientPayment('order-123');
+  console.log('Payment processed:', result);
+} catch (error) {
+  if (error.message.startsWith('CircuitOpenError')) {
+    console.error('Payment API circuit is open - service unavailable');
+    // Return fallback response or cached data
+  } else {
+    console.error('Payment failed:', error);
+  }
+}
+```
+
+## Handling Circuit Open Errors
+
+When the circuit is open, requests are immediately rejected with a `CircuitOpenError`:
+
+```typescript
+try {
+  await resilient();
+} catch (error) {
+  if (error.message.startsWith('CircuitOpenError')) {
+    // Circuit is open - service is considered down
+    // Options:
+    // 1. Return cached data
+    // 2. Return degraded response
+    // 3. Show user-friendly error
+    // 4. Route to fallback service
+    
+    return getFallbackData();
+  }
+  
+  // Handle other errors
+  throw error;
+}
+```
+
+## Circuit Breaker Hooks
+
+Three hooks specifically track circuit breaker state changes (from `src/global.d.ts:29-31`):
+
+```typescript
+type ResilienceHooks = {
+    // ... other hooks
+    onCircuitOpen?: (info: { name: string }) => void;
+    onCircuitHalfOpen?: (info: { name: string }) => void;
+    onCircuitClosed?: (info: { name: string }) => void;
+};
+```
+
+### Monitoring Example
+
+```typescript
+class CircuitMetrics {
+  private states = new Map<string, string>();
+  private openCount = 0;
+  
+  createHooks() {
+    return {
+      onCircuitOpen: ({ name }) => {
+        this.states.set(name, 'OPEN');
+        this.openCount++;
+        // Send alert to monitoring system
+        this.sendAlert('critical', `Circuit ${name} opened`);
+      },
+      
+      onCircuitHalfOpen: ({ name }) => {
+        this.states.set(name, 'HALF_OPEN');
+        // Log recovery attempt
+        this.logEvent('info', `Testing recovery for ${name}`);
+      },
+      
+      onCircuitClosed: ({ name }) => {
+        this.states.set(name, 'CLOSED');
+        // Send recovery notification
+        this.sendAlert('info', `Circuit ${name} recovered`);
+      }
+    };
+  }
+  
+  getState(name: string): string {
+    return this.states.get(name) ?? 'CLOSED';
+  }
+}
+
+const metrics = new CircuitMetrics();
+
+const resilient = withResilience(task, {
+  name: 'importantService',
+  circuitBreaker: {
+    failureThreshold: 5,
+    resetTimeoutMs: 30000
+  },
+  hooks: metrics.createHooks()
+});
+```
+
+## Best Practices
+
+1. **Set appropriate thresholds**: 3-5 failures is typical; adjust based on your service's error rates
+
+2. **Use meaningful reset timeouts**: 30-60 seconds gives services time to recover without excessive delay
+
+3. **Always monitor circuit state**: Use hooks to alert ops teams when circuits open
+
+4. **Provide fallbacks**: Have a plan for what to do when the circuit is open
+
+5. **Combine with retries**: Circuit breakers work best alongside retry logic and backoff
+
+6. **Name your circuits**: Use the `name` config to identify which service is failing
+
+<Warning>
+  Don't set `failureThreshold` too low (e.g., 1-2). Transient errors are normal; you want to detect **sustained** failure patterns.
+</Warning>
+
+## Circuit Breakers vs Retries
+
+These patterns work together:
+
+- **Retries**: Handle individual transient failures (network glitch, temporary timeout)
+- **Circuit Breakers**: Detect systemic failures (service down, database overload)
+
+```typescript
+const resilient = withResilience(task, {
+  // Retry transient failures
+  retries: 3,
+  backoff: { type: 'exponential', baseDelayMs: 100, maxDelayMs: 2000 },
+  
+  // Stop trying if failures become systemic
+  circuitBreaker: {
+    failureThreshold: 5,
+    resetTimeoutMs: 60000
+  },
+  
+  // Only retry specific errors
+  retryOn: (err) => err.message === 'TimeoutError'
+});
+```
+
+**Timeline example:**
+
+```
+Attempt 1: fail (retry after 100ms)
+Attempt 2: fail (retry after 200ms)  → failures = 1
+Attempt 3: fail (retry after 400ms)  → failures = 2
+Attempt 4: fail (no more retries)    → failures = 3
+
+Attempt 1: fail (retry after 100ms)
+Attempt 2: fail (retry after 200ms)  → failures = 4
+Attempt 3: fail (retry after 400ms)  → failures = 5 → CIRCUIT OPENS
+
+Attempt 1: CircuitOpenError (fail fast, no retry)
+Attempt 1: CircuitOpenError (fail fast, no retry)
+
+... wait 60 seconds ...
+
+Attempt 1: allowed (HALF_OPEN) → success → CIRCUIT CLOSES
+```
+
+## Related Concepts
+
+- [Retries](/concepts/retries) - Handle individual transient failures
+- [Backoff Strategies](/concepts/backoff) - Control timing between retries
+- [Timeouts](/concepts/timeouts) - Prevent indefinite waits that can trigger circuit breakers
