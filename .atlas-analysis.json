@@ -1,0 +1,76 @@
+{
+  "projectType": "sdk-library",
+  "projectName": "Resilience",
+  "projectDescription": "Lightweight resilience toolkit for JavaScript/TypeScript: retries, timeouts, backoff, circuit breaker, and metrics hooks.",
+  "theme": "aspen",
+  "primaryColor": "#cb0404",
+  "lightColor": "#f3d2d2",
+  "darkColor": "#e37b84",
+  "navigation": {
+    "groups": [
+      {
+        "group": "Get Started",
+        "pages": [
+          "introduction",
+          "quickstart",
+          "installation"
+        ]
+      },
+      {
+        "group": "Core Concepts",
+        "pages": [
+          "concepts/retries",
+          "concepts/timeouts",
+          "concepts/backoff",
+          "concepts/circuit-breaker"
+        ]
+      },
+      {
+        "group": "API Reference",
+        "pages": [
+          "api/with-resilience",
+          "api/wrapper-init",
+          "api/sleep",
+          "api/resilient-fetch",
+          "api/configuration",
+          "api/hooks"
+        ]
+      },
+      {
+        "group": "Guides",
+        "pages": [
+          "guides/basic-usage",
+          "guides/metrics-tracking",
+          "guides/error-handling",
+          "guides/advanced-patterns"
+        ]
+      },
+      {
+        "group": "Examples",
+        "pages": [
+          "examples/http-retries",
+          "examples/database-operations",
+          "examples/rate-limiting"
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "Retry logic with configurable attempts",
+    "Timeout support with abort signals",
+    "Exponential and fixed backoff strategies",
+    "Circuit breaker pattern implementation",
+    "Metrics hooks for observability",
+    "TypeScript-first with full type safety"
+  ],
+  "publicApiSurface": [
+    "withResilience(fn, config)",
+    "WrapperInit",
+    "sleep(ms, signal?)",
+    "resilientFetch(input, init?)",
+    "ResilienceConfig",
+    "ResilienceHooks",
+    "BackoffStrategy",
+    "CircuitBreakerConfig"
+  ]
+}
