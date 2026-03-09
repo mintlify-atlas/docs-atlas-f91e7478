@@ -73,7 +73,7 @@ export const sleep = (ms: number, signal: AbortSignal | undefined = activeSignal
 ### Basic Usage
 
 ```typescript
-import { sleep } from '@your-org/resilience';
+import { sleep } from '@oldwhisper/resilience';
 
 // Simple delay
 await sleep(1000); // Wait 1 second
@@ -104,7 +104,7 @@ try {
 When used inside a function wrapped with `withResilience` and `useAbortSignal: true`, sleep automatically inherits the abort signal:
 
 ```typescript
-import { withResilience, sleep } from '@your-org/resilience';
+import { withResilience, sleep } from '@oldwhisper/resilience';
 
 const processWithDelay = withResilience(
   async (data: any[]) => {

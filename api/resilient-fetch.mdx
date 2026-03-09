@@ -79,7 +79,7 @@ export const resilientFetch = (input: RequestInfo | URL, init?: RequestInit) => 
 ### Basic Usage (Drop-in Replacement)
 
 ```typescript
-import { resilientFetch } from '@your-org/resilience';
+import { resilientFetch } from '@oldwhisper/resilience';
 
 // Works exactly like regular fetch
 const response = await resilientFetch('/api/users/123');
@@ -91,7 +91,7 @@ const user = await response.json();
 When used inside a resilient function with timeout, the fetch is automatically cancelled:
 
 ```typescript
-import { withResilience, resilientFetch } from '@your-org/resilience';
+import { withResilience, resilientFetch } from '@oldwhisper/resilience';
 
 const fetchUserWithTimeout = withResilience(
   async (userId: string) => {
